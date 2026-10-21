@@ -114,7 +114,7 @@ When a bucket is empty the run is **requeued with a delay** rather than the work
 
 **Fail-open:** if the limiter itself is unavailable, calls proceed. Providers still enforce their limits, and their 429s are handled as retries. Stopping every agent because the limiter is down would be worse.
 
-**Today vs next:** buckets are per process. With N worker processes, divide limits by N. The next step is a Redis implementation (one Lua script doing refill + take atomically) so the whole fleet shares one budget.
+**Fleet-wide limits:** with `STEPWISE_REDIS_URL` set, every worker process shares the same buckets in Redis. Each reserve or settle is **one Lua script**, which Redis executes atomically: read both buckets, refill them for the elapsed time, check, take, write back. Two workers can never take the same capacity — the tests fire 60 concurrent reservations from two clients at a 1,000-token bucket and exactly 10 of 100 succeed. The script reads Redis's own clock (`TIME`), so workers whose clocks drift still agree, and both keys share a `{hash tag}` so the script also works on Redis Cluster. Without Redis, each process has its own buckets.
 
 ## 10. Retries, backoff and the circuit breaker
 
@@ -131,7 +131,15 @@ Backoff is exponential with **equal jitter** (half fixed, half random), so a tho
 
 A **circuit breaker** per provider opens after 5 consecutive failures, rejects calls for 30 s, then lets exactly one probe through (half-open). While it's open, runs are requeued without spending their retry budget on a provider that is known to be down.
 
-## 11. Webhooks
+## 11. Tracing
+
+Stepwise emits OpenTelemetry spans: `run.claim` for each time a worker picks a run up, `chat <model>` for each model call and `execute_tool <name>` for each tool call, using the OpenTelemetry GenAI attribute names (`gen_ai.request.model`, `gen_ai.usage.input_tokens`, …) so standard backends understand them.
+
+**The trace ID is the run ID.** Both are 128-bit, so every claim of a run starts its span under a parent whose trace ID is the run ID. A run that was claimed by worker A, killed, and finished by worker B is still **one trace**, and anyone holding a run ID can open it in Jaeger without a lookup table. Re-executed steps are visible as `stepwise.step.attempt = 2`; rate limiting and open circuits appear as span events.
+
+Tool calls carry a W3C `traceparent` header (HTTP tools and MCP), so a tool's own spans and logs attach to the agent run that called it.
+
+## 12. Webhooks
 
 **Transactional outbox:** a delivery row is inserted in the same transaction as the change it reports. The webhook can't be lost (the change committed, so the row exists) and can't describe a change that rolled back.
 
@@ -139,26 +147,27 @@ A dispatcher claims due rows with `SKIP LOCKED`, POSTs them, and retries with ba
 
 Signatures follow the Stripe scheme: `Stepwise-Signature: t=<unix>,v1=<hex HMAC-SHA256(secret, "<t>.<body>")>`. Signing the timestamp lets receivers reject replays of an old captured request.
 
-## 12. Self-healing triage
+## 13. Self-healing triage
 
 When a top-level run fails, Stepwise starts a **triage agent** with three built-in tools: `get_failed_run`, `record_diagnosis` and `retry_run`. A rule-based classifier adds a suggested category (transient, bad_input, tool_bug, agent_loop, budget) to the prompt; the model confirms or corrects it.
 
 `retry_run` requires human approval by default — an agent should not silently spend more money on a failing run. Built-in tools are scoped: a triage run can only read or retry the run it was created for.
 
-## 13. Testing strategy
+## 14. Testing strategy
 
 - **Conformance suite** (`store/storetest`): 15 behaviours every store must pass — exclusive claims, lease expiry and fencing, resume semantics, approvals, sub-agent resolution, cancel cascades, the outbox, and 8 goroutines racing to claim 40 runs.
 - **Engine integration tests** with real HTTP and MCP: the refund flow, crash after a side effect, transient retries, exhaustion → triage → approved retry, sub-agents, budgets, cancellation, rate-limit deferral, graceful shutdown, invented tool names.
 - **Race detector** on every test, repeated runs for timing-sensitive tests (this found a real race in the in-memory store).
+- **Redis limiter tests** against a real Redis: shared budgets across two clients, concurrent reservations never overspending, Redis outages surfacing as errors (the engine then fails open).
+- **Compose stack in CI**: boots Postgres, Redis, Jaeger, Prometheus, the API and two workers, runs the refund agent through them, and checks the trace reached Jaeger and every process is scraped.
 - **Chaos harness** (`cmd/chaos`): with `-db`, real `stepwise worker` OS processes on Postgres killed with `SIGKILL`; without it, in-process workers with simulated kills. Faults are injected on top and every invariant is verified at the end. Both run in CI.
 
-## 14. Known limitations
+## 15. Known limitations
 
-- Rate limits are per process (Redis limiter planned).
 - Streaming is available in the gateway, not yet surfaced token-by-token for durable runs.
 - A crash during a model call re-pays for that call. Providers don't offer idempotent completions, so this is inherent; it is measured rather than hidden.
 
-## 15. Interview questions this project answers
+## 16. Interview questions this project answers
 
 **How do you guarantee a refund happens once if the worker can die at any time?**
 You can't make the call itself exactly-once across a crash, so make it at-least-once and idempotent. The tool call ID is saved with the model's response before any tool runs; the tool receives `run_id:tool_call_id` as its idempotency key; a retry with the same key returns the original result. The chaos test shows 38 such retries across 375 process kills and zero double refunds.
@@ -175,6 +184,12 @@ Concurrent claimers skip rows another transaction has locked instead of waiting 
 **Why requeue instead of sleeping when rate-limited?**
 A sleeping worker holds a slot doing nothing. Requeueing frees it for runs that can proceed, and `available_at` brings the limited run back when capacity returns.
 
+**How do you rate-limit 50 workers against one API key?**
+A token bucket in Redis, updated by one Lua script per call, so refill-check-take is atomic across processes. Reserve an estimate before the call, settle the real usage after. If the bucket is empty, requeue the run with a delay instead of sleeping.
+
+**How do you debug one agent run that hopped across three machines?**
+Its trace ID is its run ID, so all claims land in one trace. Each model and tool call is a span with tokens, latency and attempt number.
+
 **How do you avoid deadlocks between sub-agents finishing and a parent being cancelled?**
 Consistent lock order: always child before parent. Cancel locks the tree deepest-first with a recursive CTE.
 
@@ -182,4 +197,4 @@ Consistent lock order: always child before parent. Cancel locks the tree deepest
 Measured: about 13% extra model calls with a worker process `SIGKILL`ed every 250 ms. Completed steps are never repeated.
 
 **What would you build next?**
-A Redis token bucket so the whole fleet shares one rate limit; OpenTelemetry traces with a span per step; partitioning the steps table by time for very large histories.
+Stream model tokens live into durable runs; partition the steps table by time for very large histories; per-tenant budgets and API keys.

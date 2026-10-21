@@ -12,6 +12,11 @@ jobs:
   test:
     runs-on: ubuntu-latest
     services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
       postgres:
         image: postgres:16
         env:
@@ -29,6 +34,7 @@ jobs:
       - name: Test (race detector, Postgres store included)
         env:
           STEPWISE_TEST_DATABASE_URL: ${{ env.PG_URL }}
+          STEPWISE_TEST_REDIS_URL: redis://localhost:6379/0
         run: |
           set -o pipefail
           make cover 2>&1 | tee test.log
@@ -62,3 +68,33 @@ jobs:
       - name: Report
         if: always()
         run: cat chaos-postgres.md chaos-memory.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start the full stack
+        run: docker compose up -d --build --wait --wait-timeout 300
+      - name: Refund agent through API, workers, Postgres, Redis and the demo shop
+        run: STEPWISE_SHOP_URL=http://shop:8090/mcp ./examples/demo.sh
+      - name: The run's trace reached Jaeger (trace ID = run ID)
+        run: |
+          RUN=$(cat /tmp/stepwise-demo-run)
+          for i in $(seq 1 30); do
+            if curl -sf "http://localhost:16686/api/traces/$RUN" | grep -q '"operationName":"chat mock"'; then
+              echo "trace $RUN found in Jaeger"; exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::trace $RUN not found in Jaeger"; exit 1
+      - name: Prometheus scrapes the API and both workers
+        run: |
+          for i in $(seq 1 30); do
+            UP=$(curl -sf http://localhost:9090/api/v1/targets | grep -o '"health":"up"' | wc -l)
+            [ "$UP" -ge 3 ] && echo "$UP targets up" && exit 0
+            sleep 2
+          done
+          echo "::error::only $UP Prometheus targets up"; exit 1
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail 80

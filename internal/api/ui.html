@@ -225,11 +225,14 @@ function select(id) {
   }
 }
 
+let shopURL = location.origin + "/demo/mcp";
+api("/v1/info").then(i => { if (i.demo_shop_url) shopURL = i.demo_shop_url; }).catch(() => {});
+
 const example = () => JSON.stringify({
   agent: {
     model: "mock",
     system: "You are a refund agent. Look up the order, check the refund policy, then refund if eligible.",
-    tools: [{type: "mcp", url: location.origin + "/demo/mcp"}],
+    tools: [{type: "mcp", url: shopURL}],
     require_approval: ["issue_refund"]
   },
   input: "Customer Asha says her earbuds arrived broken. order_id: ORD-1001, amount: 49.99, reason: damaged",

@@ -1,0 +1,87 @@
+# The full production shape on one machine:
+#
+#   docker compose up --build
+#
+#   http://localhost:8080    Stepwise UI and API
+#   http://localhost:16686   Jaeger: one trace per run
+#   http://localhost:9090    Prometheus
+#
+# One API process plus two worker processes share Postgres (state and queue)
+# and Redis (rate limits). Scale workers with `--scale worker=5`.
+
+x-stepwise-env: &stepwise-env
+  STEPWISE_DATABASE_URL: postgres://stepwise:stepwise@postgres:5432/stepwise?sslmode=disable
+  STEPWISE_REDIS_URL: redis://redis:6379/0
+  STEPWISE_RATE_LIMITS: "claude-=rpm:50,tpm:40000;gpt-=rpm:500,tpm:200000;mock=rpm:600,tpm:200000"
+  STEPWISE_WEBHOOK_SECRET: change-me
+  STEPWISE_DEMO_SHOP_URL: http://shop:8090/mcp
+  STEPWISE_MOCK_LATENCY: 150ms
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: stepwise
+      POSTGRES_PASSWORD: stepwise
+      POSTGRES_DB: stepwise
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stepwise"]
+      interval: 2s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      retries: 30
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports: ["16686:16686"]
+
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    volumes: [./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro]
+    ports: ["9090:9090"]
+
+  shop:
+    build: .
+    command: ["demo-shop"]
+    environment:
+      STEPWISE_SHOP_ADDR: ":8090"
+
+  stepwise:
+    build: .
+    command: ["api"]
+    environment:
+      <<: *stepwise-env
+    ports: ["8080:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      shop: { condition: service_started }
+    healthcheck:
+      test: ["CMD", "/stepwise", "healthcheck"]
+      interval: 2s
+      retries: 30
+
+  worker:
+    build: .
+    command: ["worker"]
+    environment:
+      <<: *stepwise-env
+      STEPWISE_METRICS_ADDR: ":9091"
+    deploy:
+      replicas: 2
+    depends_on:
+      stepwise: { condition: service_healthy } # the API runs migrations first
+
+volumes:
+  pgdata:

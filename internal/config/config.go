@@ -14,6 +14,9 @@ import (
 type Config struct {
 	Addr         string // STEPWISE_ADDR, default ":8080"
 	DatabaseURL  string // STEPWISE_DATABASE_URL; empty = in-memory store (dev only)
+	RedisURL     string // STEPWISE_REDIS_URL; shares rate limits across all workers
+	MetricsAddr  string // STEPWISE_METRICS_ADDR; metrics + health for worker-only processes
+	DemoShopURL  string // STEPWISE_DEMO_SHOP_URL; MCP URL the UI's example run uses
 	APIToken     string // STEPWISE_API_TOKEN; empty = no auth
 	MaxBodyBytes int64  // STEPWISE_MAX_BODY_BYTES, default 1 MiB
 
@@ -49,6 +52,9 @@ func Load() (Config, error) {
 	c := Config{
 		Addr:            getenv("STEPWISE_ADDR", ":8080"),
 		DatabaseURL:     os.Getenv("STEPWISE_DATABASE_URL"),
+		RedisURL:        os.Getenv("STEPWISE_REDIS_URL"),
+		MetricsAddr:     os.Getenv("STEPWISE_METRICS_ADDR"),
+		DemoShopURL:     os.Getenv("STEPWISE_DEMO_SHOP_URL"),
 		APIToken:        os.Getenv("STEPWISE_API_TOKEN"),
 		MaxBodyBytes:    1 << 20,
 		AnthropicAPIKey: os.Getenv("ANTHROPIC_API_KEY"),

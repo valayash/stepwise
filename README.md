@@ -103,13 +103,13 @@ Details and trade-offs: [docs/DESIGN.md](docs/DESIGN.md).
 | **Human-in-the-loop** | `require_approval` per tool; approve or reject via API or UI; rejections are shown to the model so it can adapt |
 | **Sub-agents** | A tool can be another agent; children run in parallel as durable runs; tokens roll up to the parent's budget |
 | **Self-healing triage** | When a run fails, a triage agent reads it, records a diagnosis, and asks (with approval) to retry transient failures |
-| **Provider resilience** | Token-bucket rate limits (RPM + TPM), circuit breaker per provider, retries with jittered exponential backoff, `Retry-After` support |
+| **Provider resilience** | Token-bucket rate limits (RPM + TPM) shared by every worker through Redis, circuit breaker per provider, retries with jittered exponential backoff, `Retry-After` support |
 | **Budgets** | Per-run token budget and `max_turns`; runaway agents stop |
 | **Webhooks** | Transactional outbox; HMAC-SHA256 signatures with timestamps; retries; dead-lettering |
-| **Observability** | Prometheus metrics at `/metrics`; structured JSON logs with run IDs; live run updates over SSE |
+| **Observability** | OpenTelemetry traces (one trace per run: the trace ID *is* the run ID; `gen_ai.*` attributes; `traceparent` sent to tools); Prometheus metrics; JSON logs; live updates over SSE |
 | **Web UI** | Run list, step timeline with re-execution badges, approvals, cancel/retry — embedded, no build step |
 | **Gateway** | OpenAI-compatible `/v1/chat/completions` passthrough (streaming included) for plain LLM calls |
-| **Minimal dependencies** | Standard library plus `pgx`, the Postgres driver |
+| **Small dependency set** | Standard library plus `pgx` (Postgres), `go-redis` and the OpenTelemetry SDK |
 
 ## Quick start
 
@@ -120,7 +120,22 @@ go run ./cmd/stepwise dev
 
 Open http://localhost:8080 → **New run** → **Start**. Approve the refund when it asks.
 
-With Postgres (any version 14+):
+**The full production setup** — Postgres, Redis, Jaeger, Prometheus, one API process, two workers and the demo shop:
+
+```bash
+docker compose up --build
+./examples/demo.sh   # with STEPWISE_SHOP_URL=http://shop:8090/mcp
+```
+
+| | |
+| --- | --- |
+| http://localhost:8080 | Stepwise UI and API |
+| http://localhost:16686 | Jaeger — paste a run ID to open its trace |
+| http://localhost:9090 | Prometheus — API and every worker are scraped |
+
+Scale workers with `docker compose up --scale worker=5`. CI boots this exact stack on every push, runs the refund agent through it, and checks the trace landed in Jaeger.
+
+Or run the binary yourself against any Postgres 14+:
 
 ```bash
 docker run -d --name pg -e POSTGRES_PASSWORD=pw -p 5432:5432 postgres:16
@@ -136,6 +151,7 @@ go run ./cmd/stepwise worker           # in another terminal: more workers, same
 | `stepwise api` / `stepwise worker` | Split roles; scale workers horizontally |
 | `stepwise migrate` | Apply database migrations |
 | `stepwise demo-shop` | The demo shop MCP server on its own |
+| `stepwise healthcheck` | Exit 0 if the local server is healthy (for containers without curl) |
 
 ## API
 
@@ -164,6 +180,10 @@ go run ./cmd/stepwise worker           # in another terminal: more workers, same
 | `STEPWISE_LEASE` | `30s` | Lease length; a dead worker's runs resume after this |
 | `STEPWISE_MAX_ATTEMPTS` | `6` | Tries per step before a run fails |
 | `STEPWISE_RATE_LIMITS` | — | e.g. `claude-=rpm:50,tpm:40000;gpt-=rpm:500` |
+| `STEPWISE_REDIS_URL` | — | Share rate limits across every worker process |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | — | Send traces, e.g. `http://jaeger:4318` |
+| `STEPWISE_METRICS_ADDR` | — | Metrics + health port for worker-only processes |
+| `STEPWISE_DEMO_SHOP_URL` | — | Shop URL the UI's example uses (reachable by workers) |
 | `STEPWISE_WEBHOOK_SECRET` | — | HMAC key for webhook signatures |
 | `STEPWISE_TRIAGE` · `_MODEL` · `_AUTO_RETRY` | `true` · auto · `false` | Self-healing triage agent |
 | `STEPWISE_MOCK_LATENCY` · `_FAIL_RATE` | `0` | Make the mock model slow or flaky |
@@ -195,9 +215,11 @@ The in-memory and Postgres stores share one **conformance suite** (leases, fenci
 - [x] Engine, in-memory store, API, UI, webhooks, MCP, triage
 - [x] Postgres store (`pgx`, embedded migrations, `SKIP LOCKED`, `LISTEN/NOTIFY` in transactions), passing the conformance suite
 - [x] Multi-process `SIGKILL` chaos test on Postgres, in CI
-- [ ] Docker Compose for Postgres + Stepwise
-- [ ] Redis-backed rate limiter for fleet-wide limits (today: per process)
-- [ ] OpenTelemetry traces (one trace per run, a span per step)
+- [x] Redis-backed rate limiter shared by the whole fleet
+- [x] OpenTelemetry traces (one trace per run, a span per model and tool call)
+- [x] Docker Compose stack, booted and exercised in CI
+- [ ] Stream model tokens live into durable runs
+- [ ] Time-partitioned steps table for very large histories
 
 ## Layout
 
@@ -209,7 +231,8 @@ internal/store      Store interface, conformance suite, memory + Postgres stores
 internal/provider   Anthropic, OpenAI and mock adapters; tool calling; streaming
 internal/tools      HTTP/MCP/built-in tool runner; spec validation
 internal/mcp        MCP client and server (Streamable HTTP)
-internal/ratelimit  token-bucket limiter
+internal/ratelimit  token-bucket limiter: local and Redis (atomic Lua)
+internal/telemetry  OpenTelemetry setup; trace ID = run ID
 internal/breaker    circuit breaker + backoff
 internal/webhook    outbox dispatcher, HMAC signing
 internal/api        REST API, SSE, embedded UI

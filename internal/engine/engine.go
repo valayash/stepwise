@@ -23,7 +23,12 @@ import (
 	"github.com/valayash/stepwise/internal/provider"
 	"github.com/valayash/stepwise/internal/ratelimit"
 	"github.com/valayash/stepwise/internal/store"
+	"github.com/valayash/stepwise/internal/telemetry"
 	"github.com/valayash/stepwise/internal/tools"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Config tunes the engine.
@@ -193,6 +198,14 @@ var errStop = errors.New("stop processing")
 // Exported so tests and the chaos harness can drive runs step by step.
 func (e *Engine) Process(ctx context.Context, run core.Run) {
 	f := core.Fence{RunID: run.ID, Token: run.LeaseToken}
+	// One span per claim, inside the run's trace (trace ID = run ID).
+	ctx, span := telemetry.Tracer().Start(telemetry.RunContext(ctx, run.ID), "run.claim", trace.WithAttributes(
+		attribute.String("stepwise.run.id", run.ID),
+		attribute.Int("stepwise.run.claim", run.Claims),
+		attribute.String("stepwise.worker.id", e.cfg.WorkerID),
+		attribute.String("gen_ai.request.model", run.Spec.Model),
+	))
+	defer span.End()
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	log := e.log.With("run_id", run.ID, "claim", run.Claims)
@@ -246,7 +259,9 @@ func (e *Engine) Process(ctx context.Context, run core.Run) {
 	switch {
 	case errors.Is(err, core.ErrFenced) || wasLost:
 		e.m.leaseLost.Inc()
+		span.SetAttributes(attribute.String("stepwise.claim.outcome", "lease_lost"))
 	case ctx.Err() != nil && !errors.Is(err, errStop):
+		span.SetAttributes(attribute.String("stepwise.claim.outcome", "shutdown"))
 		// Shutting down mid-run: hand it back so another worker resumes it now.
 		rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer rcancel()
@@ -254,6 +269,8 @@ func (e *Engine) Process(ctx context.Context, run core.Run) {
 			log.Warn("could not release run on shutdown", "err", yerr)
 		}
 	case err != nil && !errors.Is(err, errStop):
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		log.Error("run processing error", "err", err)
 		e.m.retries.Inc("store_error")
 		rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -329,6 +346,7 @@ func (x *execution) callLLM(ctx context.Context, seq int) error {
 	br := x.e.breakers.Get(p.Name())
 	if ok, wait := br.Allow(); !ok {
 		x.e.m.breakerRejected.Inc(p.Name())
+		trace.SpanFromContext(ctx).AddEvent("circuit_open", trace.WithAttributes(attribute.String("gen_ai.system", p.Name())))
 		return x.yield(ctx, store.Yield{Status: core.RunQueued, AvailableAt: x.e.now().Add(wait), Attempts: x.run.Attempts, Error: p.Name() + " circuit open"})
 	}
 	estimate := ratelimit.EstimateTokens(promptChars(msgs, toolDefs), maxTokens)
@@ -341,6 +359,8 @@ func (x *execution) callLLM(ctx context.Context, seq int) error {
 	} else if wait > 0 {
 		br.Abort()
 		x.e.m.rateLimited.Inc(model)
+		trace.SpanFromContext(ctx).AddEvent("rate_limited", trace.WithAttributes(
+			attribute.String("gen_ai.request.model", model), attribute.Int64("stepwise.wait_ms", wait.Milliseconds())))
 		return x.yield(ctx, store.Yield{Status: core.RunQueued, AvailableAt: x.e.now().Add(wait), Attempts: x.run.Attempts})
 	}
 
@@ -354,7 +374,15 @@ func (x *execution) callLLM(ctx context.Context, seq int) error {
 		x.e.m.replayed.Inc("llm")
 	}
 
-	callCtx, cancel := context.WithTimeout(ctx, x.e.cfg.LLMTimeout)
+	spanCtx, span := telemetry.Tracer().Start(ctx, "chat "+model, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
+		attribute.String("gen_ai.operation.name", "chat"),
+		attribute.String("gen_ai.system", p.Name()),
+		attribute.String("gen_ai.request.model", model),
+		attribute.Int("gen_ai.request.max_tokens", maxTokens),
+		attribute.Int("stepwise.step.seq", step.Seq),
+		attribute.Int("stepwise.step.attempt", step.Attempts),
+	))
+	callCtx, cancel := context.WithTimeout(spanCtx, x.e.cfg.LLMTimeout)
 	start := x.e.now()
 	resp, err := p.Complete(callCtx, provider.Request{
 		Model: model, Messages: msgs, Tools: toolDefs, MaxTokens: maxTokens, Temperature: spec.Temperature,
@@ -362,6 +390,19 @@ func (x *execution) callLLM(ctx context.Context, seq int) error {
 	cancel()
 	elapsed := x.e.now().Sub(start)
 	x.e.m.llmSeconds.Observe(elapsed.Seconds(), p.Name())
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	} else {
+		span.SetAttributes(
+			attribute.String("gen_ai.response.id", resp.ID),
+			attribute.StringSlice("gen_ai.response.finish_reasons", []string{resp.FinishReason}),
+			attribute.Int("gen_ai.usage.input_tokens", resp.InputTokens),
+			attribute.Int("gen_ai.usage.output_tokens", resp.OutputTokens),
+			attribute.Int("stepwise.tool_calls", len(resp.ToolCalls)),
+		)
+	}
+	span.End()
 
 	if err != nil {
 		_ = x.e.limiter.Settle(context.WithoutCancel(ctx), model, -estimate)
@@ -478,12 +519,27 @@ func (x *execution) runTool(ctx context.Context, st core.Step, spec core.ToolSpe
 		return x.spawnChild(ctx, st, spec)
 	}
 
+	spanCtx, span := telemetry.Tracer().Start(ctx, "execute_tool "+spec.Name, trace.WithAttributes(
+		attribute.String("gen_ai.operation.name", "execute_tool"),
+		attribute.String("gen_ai.tool.name", spec.Name),
+		attribute.String("gen_ai.tool.call.id", st.ToolCallID),
+		attribute.String("stepwise.tool.type", string(spec.Type)),
+		attribute.Int("stepwise.step.seq", st.Seq),
+		attribute.Int("stepwise.step.attempt", st.Attempts),
+	))
 	start := x.e.now()
-	res, err := x.e.tools.Run(ctx, tools.Call{
+	res, err := x.e.tools.Run(spanCtx, tools.Call{
 		RunID: x.run.ID, Spec: spec, Input: st.ToolInput, IdempotencyKey: st.IdempotencyKey(),
 	})
 	elapsed := x.e.now().Sub(start)
 	x.e.m.toolSeconds.Observe(elapsed.Seconds(), string(spec.Type))
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	} else {
+		span.SetAttributes(attribute.Bool("stepwise.tool.is_error", res.IsError))
+	}
+	span.End()
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()

@@ -34,6 +34,7 @@ import (
 	"github.com/valayash/stepwise/internal/store"
 	"github.com/valayash/stepwise/internal/store/memory"
 	"github.com/valayash/stepwise/internal/store/postgres"
+	"github.com/valayash/stepwise/internal/telemetry"
 	"github.com/valayash/stepwise/internal/tools"
 	"github.com/valayash/stepwise/internal/webhook"
 )
@@ -68,6 +69,8 @@ func main() {
 		err = migrate(ctx, cfg)
 	case "demo-shop":
 		err = serveShop(ctx, log, getenv("STEPWISE_SHOP_ADDR", ":8090"))
+	case "healthcheck":
+		err = healthcheck(cfg)
 	case "version":
 		fmt.Println("stepwise", version)
 	case "-h", "--help", "help":
@@ -91,7 +94,30 @@ func usage() {
   worker      workers only
   migrate     apply database migrations
   demo-shop   run the demo shop MCP server (STEPWISE_SHOP_ADDR, default :8090)
+  healthcheck exit 0 if the local server answers /healthz (for containers)
   version     print the version`)
+}
+
+// healthcheck probes this container's own server. Distroless images have
+// no curl, so the binary checks itself.
+func healthcheck(cfg config.Config) error {
+	addr := cfg.Addr
+	if cfg.MetricsAddr != "" {
+		addr = cfg.MetricsAddr
+	}
+	if strings.HasPrefix(addr, ":") {
+		addr = "127.0.0.1" + addr
+	}
+	c := &http.Client{Timeout: 2 * time.Second}
+	resp, err := c.Get("http://" + addr + "/healthz")
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("healthz returned %d", resp.StatusCode)
+	}
+	return nil
 }
 
 type roles struct{ api, worker, dispatcher, shop, dev bool }
@@ -103,16 +129,35 @@ func run(ctx context.Context, log *slog.Logger, cfg config.Config, r roles) erro
 	}
 	defer closeStore()
 
+	stopTracing, err := telemetry.Setup(ctx, "stepwise", version, modeName(r))
+	if err != nil {
+		return fmt.Errorf("tracing: %w", err)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = stopTracing(sctx)
+	}()
+
 	reg := metrics.NewRegistry()
 	router, mock := buildRouter(cfg)
 	runner := tools.NewRunner()
 	breakers := breaker.NewSet(5, 30*time.Second, nil)
 
 	var limiter ratelimit.Limiter = ratelimit.Unlimited{}
-	if len(cfg.RateLimits) > 0 {
+	switch {
+	case len(cfg.RateLimits) > 0 && cfg.RedisURL != "":
+		rl, err := ratelimit.NewRedis(ctx, cfg.RedisURL, cfg.RateLimits)
+		if err != nil {
+			return err
+		}
+		defer rl.Close()
+		limiter = rl
+		log.Info("rate limits shared across workers via redis")
+	case len(cfg.RateLimits) > 0:
 		limiter = ratelimit.NewLocal(cfg.RateLimits, nil)
 		if cfg.DatabaseURL != "" {
-			log.Warn("rate limits are per process; with several worker processes, divide limits by the process count")
+			log.Warn("rate limits are per process; set STEPWISE_REDIS_URL to share them across worker processes")
 		}
 	}
 
@@ -151,9 +196,17 @@ func run(ctx context.Context, log *slog.Logger, cfg config.Config, r roles) erro
 				Router: router, Logger: log, RequestTimeout: cfg.RequestTimeout,
 				StreamTimeout: cfg.StreamTimeout, MaxBodyBytes: cfg.MaxBodyBytes,
 			})
+			shopURL := cfg.DemoShopURL
+			if shopURL == "" && r.shop {
+				shopURL = "http://localhost" + cfg.Addr + "/demo/mcp"
+				if !strings.HasPrefix(cfg.Addr, ":") {
+					shopURL = "http://" + cfg.Addr + "/demo/mcp"
+				}
+			}
 			mux.Handle("/", (&api.Server{
 				Store: st, Tools: runner, Router: router, Token: cfg.APIToken,
 				Metrics: reg.Handler(), Gateway: gw.Handler(), Log: log, MaxBodyBytes: cfg.MaxBodyBytes,
+				Info: api.Info{Version: version, Mode: modeName(r), Models: router.Models(), DemoShopURL: shopURL},
 			}).Handler())
 		}
 		srv := &http.Server{Addr: cfg.Addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
@@ -179,6 +232,21 @@ func run(ctx context.Context, log *slog.Logger, cfg config.Config, r roles) erro
 		}
 	}
 	_ = mock
+
+	// Worker-only processes have no API server; give Prometheus and
+	// container health checks something to talk to.
+	if !r.api && cfg.MetricsAddr != "" {
+		mux := http.NewServeMux()
+		mux.Handle("GET /metrics", reg.Handler())
+		mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"status":"ok"}`)) })
+		msrv := &http.Server{Addr: cfg.MetricsAddr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+		start("metrics", func() {
+			if err := msrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error("metrics server failed", "err", err)
+			}
+		})
+		go func() { <-ctx.Done(); _ = msrv.Shutdown(context.Background()) }()
+	}
 
 	<-ctx.Done()
 	log.Info("shutting down")

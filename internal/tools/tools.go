@@ -16,6 +16,7 @@ import (
 
 	"github.com/valayash/stepwise/internal/core"
 	"github.com/valayash/stepwise/internal/mcp"
+	"github.com/valayash/stepwise/internal/telemetry"
 )
 
 // MaxResultBytes caps what a tool may hand back to the model.
@@ -120,6 +121,7 @@ func (r *Runner) runHTTP(ctx context.Context, c Call) (Result, error) {
 	req.Header.Set("Idempotency-Key", c.IdempotencyKey)
 	req.Header.Set("X-Stepwise-Run-Id", c.RunID)
 	req.Header.Set("X-Stepwise-Tool", c.Spec.Name)
+	telemetry.Inject(ctx, req.Header) // traceparent: the tool can join the run's trace
 
 	resp, err := r.HTTP.Do(req)
 	if err != nil {

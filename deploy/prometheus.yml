@@ -1,0 +1,14 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: stepwise-api
+    static_configs:
+      - targets: ["stepwise:8080"]
+
+  # Every worker replica: Docker's DNS returns one address per container.
+  - job_name: stepwise-worker
+    dns_sd_configs:
+      - names: ["worker"]
+        type: A
+        port: 9091

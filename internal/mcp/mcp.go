@@ -16,6 +16,9 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 // ProtocolVersion is the MCP revision this package speaks.
@@ -251,6 +254,7 @@ func (c *Client) post(ctx context.Context, url, sid, method string, params any, 
 	if sid != "" {
 		hr.Header.Set("Mcp-Session-Id", sid)
 	}
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(hr.Header)) // traceparent
 	resp, err := c.http.Do(hr)
 	if err != nil {
 		return nil, nil, err

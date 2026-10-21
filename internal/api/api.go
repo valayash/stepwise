@@ -36,6 +36,16 @@ type Server struct {
 	Log     *slog.Logger
 	// MaxBodyBytes caps request bodies (default 1 MiB).
 	MaxBodyBytes int64
+	// Info is served at GET /v1/info.
+	Info Info
+}
+
+// Info describes this deployment to clients and the UI.
+type Info struct {
+	Version     string   `json:"version"`
+	Mode        string   `json:"mode"`
+	Models      []string `json:"models"`
+	DemoShopURL string   `json:"demo_shop_url,omitempty"` // MCP URL reachable by workers
 }
 
 // Handler returns the root handler.
@@ -65,6 +75,7 @@ func (s *Server) Handler() http.Handler {
 	v1.HandleFunc("POST /v1/runs/{id}/steps/{step}/approve", s.decide(true))
 	v1.HandleFunc("POST /v1/runs/{id}/steps/{step}/reject", s.decide(false))
 	v1.HandleFunc("GET /v1/approvals", s.approvals)
+	v1.HandleFunc("GET /v1/info", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, s.Info) })
 	if s.Gateway != nil {
 		v1.Handle("POST /v1/chat/completions", s.Gateway)
 	}
