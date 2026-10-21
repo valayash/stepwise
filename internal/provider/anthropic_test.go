@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -71,6 +72,137 @@ func TestAnthropicUpstreamError(t *testing.T) {
 	var ue *UpstreamError
 	if !errors.As(err, &ue) || ue.Status != http.StatusTooManyRequests {
 		t.Fatalf("err = %v, want UpstreamError 429", err)
+	}
+}
+
+// A realistic Anthropic event stream, including events we ignore (ping, block start/stop).
+const anthropicSSE = `event: message_start
+data: {"type":"message_start","message":{"id":"msg_9","usage":{"input_tokens":21,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: ping
+data: {"type":"ping"}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" world"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+
+func sseServer(t *testing.T, body string, check func(anthropicRequest)) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var got anthropicRequest
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		if check != nil {
+			check(got)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(body))
+	}))
+}
+
+func TestAnthropicStream(t *testing.T) {
+	srv := sseServer(t, anthropicSSE, func(got anthropicRequest) {
+		if !got.Stream {
+			t.Error("request did not set stream=true")
+		}
+	})
+	defer srv.Close()
+
+	var deltas []string
+	res, err := NewAnthropic("k", WithAnthropicBaseURL(srv.URL)).Stream(context.Background(),
+		Request{Model: "claude-x", Messages: []Message{{Role: "user", Content: "hi"}}},
+		func(s string) error { deltas = append(deltas, s); return nil })
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+
+	if strings.Join(deltas, "|") != "Hello| world" {
+		t.Errorf("deltas = %q", deltas)
+	}
+	want := Response{ID: "msg_9", FinishReason: "stop", InputTokens: 21, OutputTokens: 2}
+	if res != want {
+		t.Errorf("response = %+v, want %+v", res, want)
+	}
+}
+
+func TestAnthropicStreamFailures(t *testing.T) {
+	cases := []struct {
+		name  string
+		body  string
+		check func(error) bool
+	}{
+		{
+			"error event",
+			"data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n",
+			func(err error) bool { var se *StreamError; return errors.As(err, &se) && se.Type == "overloaded_error" },
+		},
+		{
+			"cut off before message_stop",
+			"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"a\"}}\n\n",
+			func(err error) bool { return errors.Is(err, ErrIncompleteStream) },
+		},
+		{
+			"garbage data",
+			"data: {not json\n\n",
+			func(err error) bool { return err != nil && strings.Contains(err.Error(), "decode") },
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := sseServer(t, tc.body, nil)
+			defer srv.Close()
+			_, err := NewAnthropic("k", WithAnthropicBaseURL(srv.URL)).Stream(context.Background(),
+				Request{Model: "claude-x", Messages: []Message{{Role: "user", Content: "hi"}}},
+				func(string) error { return nil })
+			if !tc.check(err) {
+				t.Errorf("unexpected err: %v", err)
+			}
+		})
+	}
+}
+
+func TestAnthropicStreamStopsWhenCallbackFails(t *testing.T) {
+	srv := sseServer(t, anthropicSSE, nil)
+	defer srv.Close()
+
+	stop := errors.New("client gone")
+	calls := 0
+	_, err := NewAnthropic("k", WithAnthropicBaseURL(srv.URL)).Stream(context.Background(),
+		Request{Model: "claude-x", Messages: []Message{{Role: "user", Content: "hi"}}},
+		func(string) error { calls++; return stop })
+	if !errors.Is(err, stop) || calls != 1 {
+		t.Errorf("err = %v, calls = %d; want the callback error after 1 call", err, calls)
+	}
+}
+
+func TestMockStream(t *testing.T) {
+	var got []string
+	res, err := NewMock().Stream(context.Background(),
+		Request{Messages: []Message{{Role: "user", Content: "a b"}}},
+		func(s string) error { got = append(got, s); return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, "") != "mock: a b" || len(got) != 3 {
+		t.Errorf("deltas = %q", got)
+	}
+	if res.Content != "" || res.OutputTokens != 3 {
+		t.Errorf("res = %+v", res)
 	}
 }
 

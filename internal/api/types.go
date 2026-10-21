@@ -15,6 +15,37 @@ type ChatCompletionRequest struct {
 	MaxTokens   *int          `json:"max_tokens,omitempty"`
 	Temperature *float64      `json:"temperature,omitempty"`
 	Stream      bool          `json:"stream,omitempty"`
+	// StreamOptions.IncludeUsage asks for a final chunk carrying token usage.
+	StreamOptions *StreamOptions `json:"stream_options,omitempty"`
+}
+
+// StreamOptions tunes streaming responses.
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
+// ChatCompletionChunk is one server-sent event in a streaming response.
+type ChatCompletionChunk struct {
+	ID      string        `json:"id"`
+	Object  string        `json:"object"`
+	Created int64         `json:"created"`
+	Model   string        `json:"model"`
+	Choices []ChunkChoice `json:"choices"`
+	Usage   *Usage        `json:"usage,omitempty"`
+}
+
+// ChunkChoice carries the delta for one choice. FinishReason is null until the
+// last content chunk, so it is a pointer.
+type ChunkChoice struct {
+	Index        int        `json:"index"`
+	Delta        ChunkDelta `json:"delta"`
+	FinishReason *string    `json:"finish_reason"`
+}
+
+// ChunkDelta is the new content since the previous chunk.
+type ChunkDelta struct {
+	Role    string `json:"role,omitempty"`
+	Content string `json:"content,omitempty"`
 }
 
 // ChatCompletionResponse is the OpenAI-shaped, non-streaming response.

@@ -20,6 +20,7 @@ type Server struct {
 	router         *provider.Router
 	log            *slog.Logger
 	requestTimeout time.Duration
+	streamTimeout  time.Duration
 	maxBodyBytes   int64
 	now            func() time.Time
 }
@@ -28,7 +29,8 @@ type Server struct {
 type Options struct {
 	Router         *provider.Router
 	Logger         *slog.Logger
-	RequestTimeout time.Duration
+	RequestTimeout time.Duration // whole non-streaming request
+	StreamTimeout  time.Duration // whole streaming request; longer, since answers arrive gradually
 	MaxBodyBytes   int64
 }
 
@@ -40,6 +42,9 @@ func New(o Options) *Server {
 	if o.RequestTimeout <= 0 {
 		o.RequestTimeout = 60 * time.Second
 	}
+	if o.StreamTimeout <= 0 {
+		o.StreamTimeout = 5 * time.Minute
+	}
 	if o.MaxBodyBytes <= 0 {
 		o.MaxBodyBytes = 1 << 20
 	}
@@ -47,6 +52,7 @@ func New(o Options) *Server {
 		router:         o.Router,
 		log:            o.Logger,
 		requestTimeout: o.RequestTimeout,
+		streamTimeout:  o.StreamTimeout,
 		maxBodyBytes:   o.MaxBodyBytes,
 		now:            time.Now,
 	}
@@ -81,15 +87,14 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid_request", msg)
 		return
 	}
-	if req.Stream {
-		// Day 2: SSE streaming passthrough.
-		writeError(w, http.StatusNotImplemented, "invalid_request_error", "stream_unsupported", "streaming is not supported yet")
-		return
-	}
-
 	p, err := s.router.For(req.Model)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "invalid_request_error", "model_not_found", err.Error())
+		return
+	}
+
+	if req.Stream {
+		s.handleStream(w, r, p, req)
 		return
 	}
 
@@ -222,6 +227,9 @@ func (sr *statusRecorder) WriteHeader(code int) {
 	sr.status = code
 	sr.ResponseWriter.WriteHeader(code)
 }
+
+// Unwrap lets http.ResponseController reach the real writer to flush streams.
+func (sr *statusRecorder) Unwrap() http.ResponseWriter { return sr.ResponseWriter }
 
 func (s *Server) withLogging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

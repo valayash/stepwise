@@ -5,11 +5,15 @@ import (
 	"fmt"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 // Mock is a deterministic provider for tests, local dev and load testing.
 // It echoes the last user message and counts tokens as whitespace-separated words.
 type Mock struct {
+	// Delay is the pause between streamed words, to simulate generation speed.
+	Delay time.Duration
+
 	seq atomic.Int64
 }
 
@@ -50,6 +54,36 @@ func (m *Mock) Complete(ctx context.Context, req Request) (Response, error) {
 		InputTokens:  in,
 		OutputTokens: len(words),
 	}, nil
+}
+
+// Stream implements Provider. It emits the Complete answer one word at a time,
+// pausing Delay between words (zero by default; tests and load runs set it).
+func (m *Mock) Stream(ctx context.Context, req Request, onDelta DeltaFunc) (Response, error) {
+	res, err := m.Complete(ctx, req)
+	if err != nil {
+		return Response{}, err
+	}
+	words := strings.Fields(res.Content)
+	for i, w := range words {
+		if m.Delay > 0 {
+			select {
+			case <-time.After(m.Delay):
+			case <-ctx.Done():
+				return Response{}, ctx.Err()
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return Response{}, err
+		}
+		if i < len(words)-1 {
+			w += " "
+		}
+		if err := onDelta(w); err != nil {
+			return Response{}, err
+		}
+	}
+	res.Content = ""
+	return res, nil
 }
 
 func countWords(s string) int { return len(strings.Fields(s)) }

@@ -32,14 +32,37 @@ type Response struct {
 	OutputTokens int
 }
 
+// DeltaFunc receives each piece of generated text during a stream.
+// Returning an error aborts the stream.
+type DeltaFunc func(text string) error
+
 // Provider is anything that can complete a chat request.
 type Provider interface {
 	Name() string
+	// Complete returns the whole answer at once.
 	Complete(ctx context.Context, req Request) (Response, error)
+	// Stream calls onDelta for each text piece as it is generated, then returns
+	// the final metadata (ID, finish reason, token usage). Content is left empty:
+	// the caller has already seen every piece.
+	Stream(ctx context.Context, req Request, onDelta DeltaFunc) (Response, error)
 }
 
 // ErrUnknownModel is returned when no provider serves the requested model.
 var ErrUnknownModel = errors.New("unknown model")
+
+// ErrIncompleteStream means the provider closed the stream without a final event.
+var ErrIncompleteStream = errors.New("stream ended before completion")
+
+// StreamError is an error event sent by a provider after streaming started.
+type StreamError struct {
+	Provider string
+	Type     string
+	Message  string
+}
+
+func (e *StreamError) Error() string {
+	return fmt.Sprintf("%s stream error (%s): %s", e.Provider, e.Type, e.Message)
+}
 
 // UpstreamError is a non-2xx answer from a provider. The gateway uses Status
 // to decide whether the error is retryable (5xx, 429) or the caller's fault.

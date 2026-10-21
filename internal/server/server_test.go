@@ -18,9 +18,30 @@ import (
 type stubProvider struct {
 	err   error
 	delay time.Duration
+	// deltas are emitted by Stream before it returns err (if any).
+	deltas []string
 }
 
 func (s stubProvider) Name() string { return "stub" }
+
+func (s stubProvider) Stream(ctx context.Context, _ provider.Request, onDelta provider.DeltaFunc) (provider.Response, error) {
+	for _, d := range s.deltas {
+		if err := onDelta(d); err != nil {
+			return provider.Response{}, err
+		}
+	}
+	if s.delay > 0 {
+		select {
+		case <-time.After(s.delay):
+		case <-ctx.Done():
+			return provider.Response{}, ctx.Err()
+		}
+	}
+	if s.err != nil {
+		return provider.Response{}, s.err
+	}
+	return provider.Response{ID: "x", FinishReason: "stop", InputTokens: 1, OutputTokens: len(s.deltas)}, nil
+}
 
 func (s stubProvider) Complete(ctx context.Context, _ provider.Request) (provider.Response, error) {
 	if s.delay > 0 {
@@ -95,7 +116,6 @@ func TestChatCompletionsErrors(t *testing.T) {
 		{"bad role", nil, `{"model":"mock","messages":[{"role":"tool","content":"x"}]}`, http.StatusBadRequest, "invalid_request"},
 		{"zero max_tokens", nil, `{"model":"mock","max_tokens":0,"messages":[{"role":"user","content":"x"}]}`, http.StatusBadRequest, "invalid_request"},
 		{"unknown model", nil, `{"model":"gpt-9","messages":[{"role":"user","content":"x"}]}`, http.StatusNotFound, "model_not_found"},
-		{"stream not yet", nil, `{"model":"mock","stream":true,"messages":[{"role":"user","content":"x"}]}`, http.StatusNotImplemented, "stream_unsupported"},
 		{"body too large", nil, `{"model":"mock","messages":[{"role":"user","content":"` + strings.Repeat("a", 2048) + `"}]}`, http.StatusRequestEntityTooLarge, "request_too_large"},
 		{
 			"upstream 429", []provider.Route{{Prefix: "s", Provider: stubProvider{err: &provider.UpstreamError{Status: 429}}}},

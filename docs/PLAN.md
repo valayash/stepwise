@@ -15,12 +15,14 @@ Weekdays ≈ 1.5 h build, weekends ≈ 6 h. Each day ends with a green CI run an
 - [x] Request ID + structured logging middleware (`log/slog`), body size limit, graceful shutdown
 - [x] Table-driven tests with `httptest`, CI (vet, race, coverage)
 
-### Day 2 — Fri Oct 23 · Streaming
-- [ ] `stream: true` → SSE passthrough (`text/event-stream`, `http.Flusher`)
-- [ ] Translate Anthropic stream events → OpenAI `chat.completion.chunk` deltas, `data: [DONE]`
-- [ ] Cancel upstream when the client disconnects (context propagation)
-- [ ] Count output tokens during the stream; final usage chunk
-- [ ] Tests: fake SSE upstream, client-disconnect test
+### Day 2 — Fri Oct 23 · Streaming ✅ (done early, Oct 21)
+- [x] `stream: true` → SSE passthrough (`text/event-stream`, flush per chunk via `http.ResponseController`)
+- [x] Translate Anthropic stream events → OpenAI `chat.completion.chunk` deltas, `data: [DONE]`
+- [x] Cancel upstream when the client disconnects (context propagation)
+- [x] Token usage from the stream; `stream_options.include_usage` final chunk
+- [x] Lazy headers: errors before the first token still return a JSON error with a real status
+- [x] Mid-stream errors → OpenAI-style error event, no `[DONE]`
+- [x] Tests: fake SSE upstream, error/cut-off/garbage streams, real client-disconnect test
 
 ### Day 3 — Sat Oct 24 · Postgres
 - [ ] `docker-compose.yml`: Postgres + Redis

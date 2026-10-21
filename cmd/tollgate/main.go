@@ -30,7 +30,9 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
-	routes := []provider.Route{{Prefix: "mock", Provider: provider.NewMock()}}
+	mock := provider.NewMock()
+	mock.Delay = cfg.MockDelay
+	routes := []provider.Route{{Prefix: "mock", Provider: mock}}
 	if cfg.AnthropicAPIKey != "" {
 		routes = append(routes, provider.Route{Prefix: "claude-", Provider: provider.NewAnthropic(cfg.AnthropicAPIKey)})
 	} else {
@@ -41,6 +43,7 @@ func run(log *slog.Logger) error {
 		Router:         provider.NewRouter(routes...),
 		Logger:         log,
 		RequestTimeout: cfg.RequestTimeout,
+		StreamTimeout:  cfg.StreamTimeout,
 		MaxBodyBytes:   cfg.MaxBodyBytes,
 	})
 
