@@ -56,9 +56,28 @@ func NewAnthropic(apiKey string, opts ...AnthropicOption) *Anthropic {
 // Name implements Provider.
 func (a *Anthropic) Name() string { return "anthropic" }
 
+// anthropicMessage.Content is either a plain string or a list of content
+// blocks (text, tool_use, tool_result).
 type anthropicMessage struct {
 	Role    string `json:"role"`
-	Content string `json:"content"`
+	Content any    `json:"content"`
+}
+
+type anthropicBlock struct {
+	Type      string          `json:"type"`
+	Text      string          `json:"text,omitempty"`
+	ID        string          `json:"id,omitempty"`          // tool_use
+	Name      string          `json:"name,omitempty"`        // tool_use
+	Input     json.RawMessage `json:"input,omitempty"`       // tool_use
+	ToolUseID string          `json:"tool_use_id,omitempty"` // tool_result
+	Content   string          `json:"content,omitempty"`     // tool_result
+	IsError   bool            `json:"is_error,omitempty"`    // tool_result
+}
+
+type anthropicTool struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	InputSchema json.RawMessage `json:"input_schema"`
 }
 
 type anthropicRequest struct {
@@ -66,21 +85,69 @@ type anthropicRequest struct {
 	MaxTokens   int                `json:"max_tokens"`
 	System      string             `json:"system,omitempty"`
 	Messages    []anthropicMessage `json:"messages"`
+	Tools       []anthropicTool    `json:"tools,omitempty"`
 	Temperature *float64           `json:"temperature,omitempty"`
 	Stream      bool               `json:"stream,omitempty"`
 }
 
 type anthropicResponse struct {
-	ID         string `json:"id"`
-	StopReason string `json:"stop_reason"`
-	Content    []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	} `json:"content"`
-	Usage struct {
+	ID         string           `json:"id"`
+	StopReason string           `json:"stop_reason"`
+	Content    []anthropicBlock `json:"content"`
+	Usage      struct {
 		InputTokens  int `json:"input_tokens"`
 		OutputTokens int `json:"output_tokens"`
 	} `json:"usage"`
+}
+
+// toAnthropicMessages converts neutral messages into Anthropic's shape:
+//   - system messages become the top-level system field;
+//   - assistant tool calls become tool_use blocks;
+//   - consecutive tool results are merged into ONE user message of
+//     tool_result blocks, because Anthropic requires every result for a turn
+//     to arrive together right after the assistant's tool_use turn.
+func toAnthropicMessages(msgs []Message) (system string, out []anthropicMessage) {
+	var sys []string
+	for _, m := range msgs {
+		switch m.Role {
+		case "system":
+			sys = append(sys, m.Content)
+		case "assistant":
+			if len(m.ToolCalls) == 0 {
+				out = append(out, anthropicMessage{Role: "assistant", Content: m.Content})
+				continue
+			}
+			var blocks []anthropicBlock
+			if m.Content != "" {
+				blocks = append(blocks, anthropicBlock{Type: "text", Text: m.Content})
+			}
+			for _, tc := range m.ToolCalls {
+				blocks = append(blocks, anthropicBlock{Type: "tool_use", ID: tc.ID, Name: tc.Name, Input: jsonObject(tc.Input)})
+			}
+			out = append(out, anthropicMessage{Role: "assistant", Content: blocks})
+		case "tool":
+			res := anthropicBlock{Type: "tool_result", ToolUseID: m.ToolCallID, Content: m.Content, IsError: m.IsError}
+			if n := len(out); n > 0 && out[n-1].Role == "user" {
+				if blocks, ok := out[n-1].Content.([]anthropicBlock); ok && len(blocks) > 0 && blocks[0].Type == "tool_result" {
+					out[n-1].Content = append(blocks, res)
+					continue
+				}
+			}
+			out = append(out, anthropicMessage{Role: "user", Content: []anthropicBlock{res}})
+		default: // user
+			out = append(out, anthropicMessage{Role: "user", Content: m.Content})
+		}
+	}
+	return strings.Join(sys, "\n\n"), out
+}
+
+// jsonObject guarantees a JSON object: providers reject a missing or null tool input.
+func jsonObject(raw json.RawMessage) json.RawMessage {
+	t := bytes.TrimSpace(raw)
+	if len(t) == 0 || bytes.Equal(t, []byte("null")) {
+		return json.RawMessage(`{}`)
+	}
+	return raw
 }
 
 // anthropicStreamEvent covers every streaming event type we read; each event
@@ -126,15 +193,20 @@ func (a *Anthropic) Complete(ctx context.Context, req Request) (Response, error)
 	}
 
 	var text strings.Builder
+	var calls []ToolCall
 	for _, c := range ar.Content {
-		if c.Type == "text" {
+		switch c.Type {
+		case "text":
 			text.WriteString(c.Text)
+		case "tool_use":
+			calls = append(calls, ToolCall{ID: c.ID, Name: c.Name, Input: jsonObject(c.Input)})
 		}
 	}
 
 	return Response{
 		ID:           ar.ID,
 		Content:      text.String(),
+		ToolCalls:    calls,
 		FinishReason: mapAnthropicStop(ar.StopReason),
 		InputTokens:  ar.Usage.InputTokens,
 		OutputTokens: ar.Usage.OutputTokens,
@@ -208,16 +280,10 @@ func (a *Anthropic) send(ctx context.Context, req Request, stream bool) (*http.R
 		body.MaxTokens = anthropicDefaultMax
 	}
 
-	// Anthropic takes system prompts as a top-level field, not a message role.
-	var system []string
-	for _, m := range req.Messages {
-		if m.Role == "system" {
-			system = append(system, m.Content)
-			continue
-		}
-		body.Messages = append(body.Messages, anthropicMessage{Role: m.Role, Content: m.Content})
+	body.System, body.Messages = toAnthropicMessages(req.Messages)
+	for _, t := range req.Tools {
+		body.Tools = append(body.Tools, anthropicTool{Name: t.Name, Description: t.Description, InputSchema: jsonObject(t.InputSchema)})
 	}
-	body.System = strings.Join(system, "\n\n")
 
 	buf, err := json.Marshal(body)
 	if err != nil {
@@ -242,7 +308,10 @@ func (a *Anthropic) send(ctx context.Context, req Request, stream bool) (*http.R
 	if resp.StatusCode/100 != 2 {
 		defer resp.Body.Close()
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-		return nil, &UpstreamError{Provider: a.Name(), Status: resp.StatusCode, Body: truncate(string(raw), 512)}
+		return nil, &UpstreamError{
+			Provider: a.Name(), Status: resp.StatusCode, Body: truncate(string(raw), 512),
+			RetryAfter: resp.Header.Get("retry-after"),
+		}
 	}
 	return resp, nil
 }

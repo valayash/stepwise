@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stepwise</title>
+<style>
+:root {
+  --bg: #f6f5f2; --panel: #ffffff; --ink: #1b1d1f; --muted: #6b6f75; --line: #e4e2dc;
+  --accent: #2f5bea; --ok: #1f8a4c; --warn: #b7791f; --bad: #c0392b; --run: #2f5bea; --wait: #8e44ad;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #121315; --panel: #1b1d20; --ink: #e8e6e1; --muted: #9a9ea5; --line: #2c2f33; --accent: #7c9cff; --run: #7c9cff; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; background: var(--bg); color: var(--ink); }
+header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 2; }
+header h1 { font-size: 16px; margin: 0; letter-spacing: .2px; }
+header h1 span { color: var(--muted); font-weight: 400; }
+header .spacer { flex: 1; }
+button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--ink); padding: 6px 12px; border-radius: 8px; cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.ok { border-color: var(--ok); color: var(--ok); }
+button.bad { border-color: var(--bad); color: var(--bad); }
+button:disabled { opacity: .5; cursor: default; }
+input, textarea { font: inherit; background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
+main { display: grid; grid-template-columns: minmax(280px, 380px) 1fr; height: calc(100vh - 53px); }
+@media (max-width: 760px) { main { grid-template-columns: 1fr; height: auto; } #list { max-height: 45vh; } }
+#list { border-right: 1px solid var(--line); overflow: auto; background: var(--panel); }
+.tabs { display: flex; gap: 4px; padding: 10px; border-bottom: 1px solid var(--line); flex-wrap: wrap; position: sticky; top: 0; background: var(--panel); }
+.tabs button { padding: 3px 10px; font-size: 12px; border-radius: 999px; }
+.tabs button.on { background: var(--ink); color: var(--panel); border-color: var(--ink); }
+.run { padding: 10px 14px; border-bottom: 1px solid var(--line); cursor: pointer; }
+.run:hover { background: var(--bg); }
+.run.sel { box-shadow: inset 3px 0 0 var(--accent); background: var(--bg); }
+.run .top { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+.run .input { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
+.id { font-family: var(--mono); font-size: 12px; }
+.pill { font-size: 11px; padding: 1px 8px; border-radius: 999px; border: 1px solid currentColor; white-space: nowrap; }
+.s-queued { color: var(--muted); } .s-running { color: var(--run); } .s-waiting { color: var(--wait); }
+.s-completed { color: var(--ok); } .s-failed { color: var(--bad); } .s-cancelled { color: var(--muted); }
+.s-pending_approval { color: var(--wait); } .s-waiting_child { color: var(--wait); } .s-approved { color: var(--run); }
+#detail { overflow: auto; padding: 20px 24px 60px; }
+.empty { color: var(--muted); margin-top: 20vh; text-align: center; }
+.head { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.head h2 { margin: 0; font-size: 18px; font-family: var(--mono); }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 16px 0; }
+.stat { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+.stat b { display: block; font-size: 18px; }
+.stat small { color: var(--muted); }
+.bar { height: 4px; background: var(--line); border-radius: 4px; margin-top: 6px; overflow: hidden; }
+.bar i { display: block; height: 100%; background: var(--accent); }
+.box { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin: 10px 0; }
+.box h3 { margin: 0 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); }
+.box.err { border-color: var(--bad); }
+pre { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; word-break: break-word; margin: 0; }
+.timeline { position: relative; margin-top: 18px; padding-left: 18px; border-left: 2px solid var(--line); }
+.step { position: relative; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin: 0 0 10px; }
+.step::before { content: ""; position: absolute; left: -26px; top: 14px; width: 12px; height: 12px; border-radius: 50%; background: var(--panel); border: 2px solid var(--muted); }
+.step.k-llm::before { border-color: var(--accent); }
+.step.k-tool::before { border-color: var(--ok); }
+.step.st-pending_approval { border-color: var(--wait); }
+.step .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.step .kind { font-weight: 600; }
+.meta { color: var(--muted); font-size: 12px; }
+.badge { font-size: 11px; background: #f39c121f; color: var(--warn); border-radius: 6px; padding: 1px 6px; }
+details { margin-top: 6px; } summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.actions { display: flex; gap: 8px; margin-top: 8px; }
+dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: var(--ink); width: min(760px, 94vw); padding: 18px; }
+dialog textarea { width: 100%; height: 50vh; font-family: var(--mono); font-size: 12px; }
+dialog::backdrop { background: #0006; }
+.notice { color: var(--bad); font-size: 12px; margin-top: 6px; min-height: 16px; }
+a { color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Stepwise <span>durable agent runtime</span></h1>
+  <div class="spacer"></div>
+  <span id="inbox" class="meta"></span>
+  <input id="token" type="password" placeholder="API token (if set)" size="16">
+  <button class="primary" id="new">New run</button>
+</header>
+<main>
+  <section id="list">
+    <div class="tabs" id="tabs"></div>
+    <div id="runs"></div>
+  </section>
+  <section id="detail"><div class="empty">Select a run, or start one with <b>New run</b>.</div></section>
+</main>
+
+<dialog id="dlg">
+  <h3 style="margin-top:0">Start a run</h3>
+  <p class="meta">POSTs this body to <code>/v1/runs</code>. The example uses the built-in demo shop (an MCP server) and needs approval before refunding.</p>
+  <textarea id="body"></textarea>
+  <div class="notice" id="dlgErr"></div>
+  <div class="actions"><button class="primary" id="go">Start</button><button id="close">Close</button></div>
+</dialog>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const statuses = ["all", "running", "waiting", "queued", "completed", "failed", "cancelled"];
+let filter = "all", selected = null, live = null, pollTimer = null;
+
+$("#token").value = (() => { try { return localStorage.getItem("stepwise_token") || ""; } catch { return ""; } })();
+$("#token").onchange = e => { try { localStorage.setItem("stepwise_token", e.target.value); } catch {} refresh(); };
+
+async function api(path, opts = {}) {
+  const headers = {"Content-Type": "application/json"};
+  const tok = $("#token").value.trim();
+  if (tok) headers.Authorization = "Bearer " + tok;
+  const res = await fetch(path, {...opts, headers});
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error?.message || res.statusText);
+  return body;
+}
+
+function ago(t) {
+  const s = Math.max(0, (Date.now() - new Date(t)) / 1000);
+  if (s < 60) return Math.floor(s) + "s ago";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  return Math.floor(s / 3600) + "h ago";
+}
+
+function renderTabs() {
+  $("#tabs").innerHTML = statuses.map(s => `<button class="${s === filter ? "on" : ""}" data-s="${s}">${s}</button>`).join("");
+  $("#tabs").querySelectorAll("button").forEach(b => b.onclick = () => { filter = b.dataset.s; renderTabs(); refresh(); });
+}
+
+async function refresh() {
+  try {
+    const q = filter === "all" ? "" : "&status=" + filter;
+    const {runs} = await api("/v1/runs?limit=100" + q);
+    $("#runs").innerHTML = runs.map(r => `
+      <div class="run ${r.id === selected ? "sel" : ""}" data-id="${r.id}">
+        <div class="top"><span class="id">${r.id.slice(0, 12)}${r.parent_run_id ? " ↳" : ""}</span>
+        <span class="pill s-${r.status}">${r.status}</span></div>
+        <div class="input">${esc(r.agent.model)} · ${esc(r.input)}</div>
+        <div class="meta">${ago(r.created_at)} · ${r.tokens_used} tokens</div>
+      </div>`).join("") || `<div class="empty" style="margin-top:20px">No runs.</div>`;
+    $("#runs").querySelectorAll(".run").forEach(el => el.onclick = () => select(el.dataset.id));
+    const {approvals} = await api("/v1/approvals");
+    $("#inbox").textContent = approvals.length ? `${approvals.length} awaiting approval` : "";
+  } catch (e) { $("#runs").innerHTML = `<div class="empty" style="margin-top:20px">${esc(e.message)}</div>`; }
+}
+
+function stepCard(r, s) {
+  const tokens = s.llm ? s.llm.input_tokens + s.llm.output_tokens : 0;
+  const title = s.kind === "llm" ? "Model" : "Tool · " + esc(s.tool_name);
+  let body = "";
+  if (s.llm) {
+    if (s.llm.content) body += `<pre>${esc(s.llm.content)}</pre>`;
+    (s.llm.tool_calls || []).forEach(c => body += `<div class="meta">→ calls <b>${esc(c.name)}</b> <code>${esc(JSON.stringify(c.input))}</code></div>`);
+  }
+  if (s.kind === "tool") {
+    body += `<details ${s.status === "pending_approval" ? "open" : ""}><summary>input</summary><pre>${esc(JSON.stringify(s.tool_input, null, 2))}</pre></details>`;
+    if (s.result) body += `<details ${s.is_error ? "open" : ""}><summary>${s.is_error ? "error" : "result"}</summary><pre>${esc(s.result)}</pre></details>`;
+    if (s.child_run_id) body += `<div class="meta">sub-agent <a href="#" data-go="${s.child_run_id}">${s.child_run_id.slice(0, 12)}</a></div>`;
+    if (s.approval) body += `<div class="meta">${s.approval.approved ? "approved" : "rejected"}${s.approval.decided_by ? " by " + esc(s.approval.decided_by) : ""}${s.approval.note ? ": " + esc(s.approval.note) : ""}</div>`;
+  }
+  const act = s.status === "pending_approval" ? `<div class="actions">
+      <button class="ok" data-approve="${s.id}">Approve</button>
+      <button class="bad" data-reject="${s.id}">Reject</button></div>` : "";
+  return `<div class="step k-${s.kind} st-${s.status}">
+    <div class="row"><span class="meta">#${s.seq}</span><span class="kind">${title}</span>
+    <span class="pill s-${s.status}">${s.status.replace("_", " ")}</span>
+    ${s.attempts > 1 ? `<span class="badge" title="Executed again after a crash or transient failure">re-executed ×${s.attempts}</span>` : ""}
+    <span class="meta">${s.duration_ms ? s.duration_ms + " ms" : ""}${tokens ? " · " + tokens + " tokens" : ""}</span></div>
+    ${body}${act}</div>`;
+}
+
+function renderRun(r) {
+  const pct = Math.min(100, Math.round(100 * r.tokens_used / r.budget_tokens));
+  const terminal = ["completed", "failed", "cancelled"].includes(r.status);
+  let triage = "";
+  if (r.triage) { try { const d = JSON.parse(typeof r.triage === "string" ? r.triage : JSON.stringify(r.triage)); triage = `<div class="box"><h3>Triage diagnosis</h3><b>${esc(d.category)}</b> — ${esc(d.summary)} <a href="#" data-go="${d.triage_run_id}">view triage run</a></div>`; } catch {} }
+  $("#detail").innerHTML = `
+    <div class="head"><h2>${r.id}</h2><span class="pill s-${r.status}">${r.status}</span>
+      ${r.parent_run_id ? `<span class="meta">sub-agent of <a href="#" data-go="${r.parent_run_id}">${r.parent_run_id.slice(0, 12)}</a></span>` : ""}
+      <span class="spacer" style="flex:1"></span>
+      ${!terminal ? `<button class="bad" id="cancel">Cancel</button>` : ""}
+      ${r.status === "failed" ? `<button id="retry">Retry</button>` : ""}</div>
+    <div class="grid">
+      <div class="stat"><small>Model</small><b>${esc(r.agent.model)}</b></div>
+      <div class="stat"><small>Tokens</small><b>${r.tokens_used.toLocaleString()} <small>/ ${r.budget_tokens.toLocaleString()}</small></b><div class="bar"><i style="width:${pct}%"></i></div></div>
+      <div class="stat"><small>Steps</small><b>${r.steps.length}</b></div>
+      <div class="stat"><small>Claims</small><b>${r.claims}</b><small>${r.claims > 1 ? "picked up again after yield, retry or crash" : ""}</small></div>
+    </div>
+    <div class="box"><h3>Input</h3><pre>${esc(r.input)}</pre></div>
+    ${r.output ? `<div class="box"><h3>Output</h3><pre>${esc(r.output)}</pre></div>` : ""}
+    ${r.error ? `<div class="box err"><h3>${esc(r.failure_kind || "Error")}</h3><pre>${esc(r.error)}</pre></div>` : ""}
+    ${triage}
+    <div class="timeline">${r.steps.map(s => stepCard(r, s)).join("") || `<div class="meta">No steps yet.</div>`}</div>
+    <div class="notice" id="actErr"></div>`;
+  const act = async (p, b) => { try { await api(p, {method: "POST", body: JSON.stringify(b || {})}); load(r.id); refresh(); } catch (e) { $("#actErr").textContent = e.message; } };
+  $("#cancel") && ($("#cancel").onclick = () => act(`/v1/runs/${r.id}/cancel`));
+  $("#retry") && ($("#retry").onclick = () => act(`/v1/runs/${r.id}/retry`));
+  $("#detail").querySelectorAll("[data-approve]").forEach(b => b.onclick = () => act(`/v1/runs/${r.id}/steps/${b.dataset.approve}/approve`, {decided_by: "web-ui"}));
+  $("#detail").querySelectorAll("[data-reject]").forEach(b => b.onclick = () => {
+    const note = prompt("Reason for rejecting (shown to the agent):") || "";
+    act(`/v1/runs/${r.id}/steps/${b.dataset.reject}/reject`, {note, decided_by: "web-ui"});
+  });
+  $("#detail").querySelectorAll("[data-go]").forEach(a => a.onclick = e => { e.preventDefault(); select(a.dataset.go); });
+}
+
+async function load(id) {
+  try { const r = await api("/v1/runs/" + id); if (id === selected) renderRun(r); return r; }
+  catch (e) { $("#detail").innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+}
+
+function select(id) {
+  selected = id;
+  if (live) { live.close(); live = null; }
+  clearInterval(pollTimer);
+  document.querySelectorAll(".run").forEach(el => el.classList.toggle("sel", el.dataset.id === id));
+  load(id);
+  if (!$("#token").value.trim() && window.EventSource) {
+    live = new EventSource(`/v1/runs/${id}/events`);
+    live.addEventListener("run", e => { if (id === selected) renderRun(JSON.parse(e.data)); refresh(); });
+    live.onerror = () => { live && live.close(); live = null; };
+  } else {
+    pollTimer = setInterval(() => load(id), 1000);
+  }
+}
+
+const example = () => JSON.stringify({
+  agent: {
+    model: "mock",
+    system: "You are a refund agent. Look up the order, check the refund policy, then refund if eligible.",
+    tools: [{type: "mcp", url: location.origin + "/demo/mcp"}],
+    require_approval: ["issue_refund"]
+  },
+  input: "Customer Asha says her earbuds arrived broken. order_id: ORD-1001, amount: 49.99, reason: damaged",
+  budget_tokens: 20000,
+  metadata: {ticket: "SUP-4821"}
+}, null, 2);
+
+$("#new").onclick = () => { if (!$("#body").value) $("#body").value = example(); $("#dlgErr").textContent = ""; $("#dlg").showModal(); };
+$("#close").onclick = () => $("#dlg").close();
+$("#go").onclick = async () => {
+  try {
+    const r = await api("/v1/runs", {method: "POST", body: $("#body").value});
+    $("#dlg").close(); await refresh(); select(r.id);
+  } catch (e) { $("#dlgErr").textContent = e.message; }
+};
+
+renderTabs(); refresh(); setInterval(refresh, 3000);
+</script>
+</body>
+</html>

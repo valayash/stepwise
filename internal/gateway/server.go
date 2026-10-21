@@ -1,5 +1,6 @@
-// Package server exposes the OpenAI-compatible HTTP API.
-package server
+// Package gateway exposes an OpenAI-compatible passthrough endpoint, so plain
+// (non-durable) LLM calls can share Stepwise providers and credentials.
+package gateway
 
 import (
 	"context"
@@ -11,8 +12,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/valayash/tollgate/internal/api"
-	"github.com/valayash/tollgate/internal/provider"
+	"github.com/valayash/stepwise/internal/api"
+	"github.com/valayash/stepwise/internal/provider"
 )
 
 // Server wires HTTP handlers to the provider router.

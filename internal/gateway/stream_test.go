@@ -1,4 +1,4 @@
-package server
+package gateway
 
 import (
 	"bufio"
@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/valayash/tollgate/internal/api"
-	"github.com/valayash/tollgate/internal/provider"
+	"github.com/valayash/stepwise/internal/api"
+	"github.com/valayash/stepwise/internal/provider"
 )
 
 // readEvents splits an SSE body into its data payloads.

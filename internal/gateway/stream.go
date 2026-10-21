@@ -1,4 +1,4 @@
-package server
+package gateway
 
 import (
 	"context"
@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/valayash/tollgate/internal/api"
-	"github.com/valayash/tollgate/internal/provider"
+	"github.com/valayash/stepwise/internal/api"
+	"github.com/valayash/stepwise/internal/provider"
 )
 
 // sseWriter writes server-sent events and flushes after each one so the client

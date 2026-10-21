@@ -1,4 +1,4 @@
-package server
+package gateway
 
 import (
 	"context"
@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/valayash/tollgate/internal/api"
-	"github.com/valayash/tollgate/internal/provider"
+	"github.com/valayash/stepwise/internal/api"
+	"github.com/valayash/stepwise/internal/provider"
 )
 
 type stubProvider struct {

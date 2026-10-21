@@ -15,7 +15,20 @@ jobs:
           go-version-file: go.mod
       - name: Lint
         run: make lint
-      - name: Test
+      - name: Test (race detector)
         run: make cover
       - name: Build
         run: make build
+
+  chaos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Chaos test (workers killed at random)
+        run: go run ./cmd/chaos -runs 500 -workers 6 -kill-every 150ms -latency 30ms -lease 300ms -out chaos.md
+      - name: Report
+        if: always()
+        run: cat chaos.md >> "$GITHUB_STEP_SUMMARY"

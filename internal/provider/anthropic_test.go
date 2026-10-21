@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -54,7 +55,7 @@ func TestAnthropicComplete(t *testing.T) {
 	}
 
 	want := Response{ID: "msg_1", Content: "Hello there", FinishReason: "length", InputTokens: 12, OutputTokens: 3}
-	if res != want {
+	if !reflect.DeepEqual(res, want) {
 		t.Errorf("response = %+v, want %+v", res, want)
 	}
 }
@@ -135,7 +136,7 @@ func TestAnthropicStream(t *testing.T) {
 		t.Errorf("deltas = %q", deltas)
 	}
 	want := Response{ID: "msg_9", FinishReason: "stop", InputTokens: 21, OutputTokens: 2}
-	if res != want {
+	if !reflect.DeepEqual(res, want) {
 		t.Errorf("response = %+v, want %+v", res, want)
 	}
 }

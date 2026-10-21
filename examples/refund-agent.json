@@ -1,0 +1,14 @@
+{
+  "agent": {
+    "model": "mock",
+    "system": "You are a customer-support refund agent. Look up the order, check the refund policy, and refund only if the order is eligible. Explain your decision in one short paragraph.",
+    "tools": [
+      { "type": "mcp", "url": "http://localhost:8080/demo/mcp" }
+    ],
+    "require_approval": ["issue_refund"],
+    "max_turns": 10
+  },
+  "input": "Customer Asha says her earbuds arrived broken. order_id: ORD-1001, amount: 49.99, reason: damaged",
+  "budget_tokens": 20000,
+  "metadata": { "ticket": "SUP-4821" }
+}

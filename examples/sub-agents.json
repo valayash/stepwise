@@ -1,0 +1,22 @@
+{
+  "agent": {
+    "model": "mock",
+    "system": "You coordinate support work. Delegate order research to the researcher sub-agent, then summarise what it found.",
+    "tools": [
+      {
+        "type": "agent",
+        "name": "researcher",
+        "description": "Investigates one order and reports its status and refund eligibility.",
+        "agent": {
+          "model": "mock",
+          "system": "You research orders. Look up the order and check its refund policy.",
+          "tools": [
+            { "type": "mcp", "url": "http://localhost:8080/demo/mcp", "include": ["get_order", "check_refund_policy"] }
+          ]
+        }
+      }
+    ]
+  },
+  "input": "Is order ORD-1003 still refundable?\ntask: Research order_id: ORD-1003",
+  "budget_tokens": 30000
+}
