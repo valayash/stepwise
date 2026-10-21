@@ -470,8 +470,9 @@ func (m *Store) DecideApproval(_ context.Context, runID string, stepID int64, a 
 		return core.ErrNotFound
 	}
 	if s.Status != core.StepPendingApproval || r.Status.Terminal() {
+		err := fmt.Errorf("%w: step is %s", core.ErrNotRunnable, s.Status) // read before unlocking
 		m.mu.Unlock()
-		return fmt.Errorf("%w: step is %s", core.ErrNotRunnable, s.Status)
+		return err
 	}
 	now := m.now()
 	a.DecidedAt = now
@@ -508,8 +509,9 @@ func (m *Store) Cancel(_ context.Context, runID string) error {
 		return core.ErrNotFound
 	}
 	if r.Status.Terminal() {
+		err := fmt.Errorf("%w: run is %s", core.ErrNotRunnable, r.Status) // read before unlocking
 		m.mu.Unlock()
-		return fmt.Errorf("%w: run is %s", core.ErrNotRunnable, r.Status)
+		return err
 	}
 	now := m.now()
 	changed := []string{}
@@ -540,8 +542,9 @@ func (m *Store) Retry(_ context.Context, runID string) error {
 		return core.ErrNotFound
 	}
 	if r.Status != core.RunFailed {
+		err := fmt.Errorf("%w: only failed runs can be retried (run is %s)", core.ErrNotRunnable, r.Status) // read before unlocking
 		m.mu.Unlock()
-		return fmt.Errorf("%w: only failed runs can be retried (run is %s)", core.ErrNotRunnable, r.Status)
+		return err
 	}
 	now := m.now()
 	r.Status = core.RunQueued
