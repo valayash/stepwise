@@ -5,9 +5,20 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  PG_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -15,20 +26,32 @@ jobs:
           go-version-file: go.mod
       - name: Lint
         run: make lint
-      - name: Test (race detector)
+      - name: Test (race detector, Postgres store included)
+        env:
+          STEPWISE_TEST_DATABASE_URL: ${{ env.PG_URL }}
         run: make cover
       - name: Build
         run: make build
 
   chaos:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Chaos test (workers killed at random)
-        run: go run ./cmd/chaos -runs 500 -workers 6 -kill-every 150ms -latency 30ms -lease 300ms -out chaos.md
+      - name: Chaos test, in-process (simulated kills)
+        run: go run ./cmd/chaos -runs 500 -workers 6 -kill-every 150ms -latency 30ms -lease 300ms -out chaos-memory.md
+      - name: Chaos test, Postgres (worker processes killed with SIGKILL)
+        run: go run ./cmd/chaos -db "$PG_URL" -runs 300 -workers 6 -kill-every 300ms -latency 30ms -lease 1s -timeout 6m -out chaos-postgres.md
       - name: Report
         if: always()
-        run: cat chaos.md >> "$GITHUB_STEP_SUMMARY"
+        run: cat chaos-postgres.md chaos-memory.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true

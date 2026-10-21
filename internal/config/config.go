@@ -27,10 +27,13 @@ type Config struct {
 	MockFailRate    float64       // STEPWISE_MOCK_FAIL_RATE, 0..1 simulated outages
 
 	// Engine.
-	Workers     int             // STEPWISE_WORKERS, concurrent runs per process, default 8
-	Lease       time.Duration   // STEPWISE_LEASE, default 30s
-	MaxAttempts int             // STEPWISE_MAX_ATTEMPTS, tries per step, default 6
-	RateLimits  ratelimit.Rules // STEPWISE_RATE_LIMITS, e.g. "claude-=rpm:50,tpm:40000"
+	Workers      int             // STEPWISE_WORKERS, concurrent runs per process, default 8
+	Lease        time.Duration   // STEPWISE_LEASE, default 30s
+	MaxAttempts  int             // STEPWISE_MAX_ATTEMPTS, tries per step, default 6
+	PollInterval time.Duration   // STEPWISE_POLL_INTERVAL, idle polling, default 1s
+	BackoffBase  time.Duration   // STEPWISE_BACKOFF_BASE, first retry delay, default 1s
+	BackoffMax   time.Duration   // STEPWISE_BACKOFF_MAX, retry delay cap, default 2m
+	RateLimits   ratelimit.Rules // STEPWISE_RATE_LIMITS, e.g. "claude-=rpm:50,tpm:40000"
 
 	// Webhooks and triage.
 	WebhookSecret   string // STEPWISE_WEBHOOK_SECRET; signs deliveries
@@ -70,6 +73,9 @@ func Load() (Config, error) {
 		{"STEPWISE_MOCK_DELAY", &c.MockDelay},
 		{"STEPWISE_MOCK_LATENCY", &c.MockLatency},
 		{"STEPWISE_LEASE", &c.Lease},
+		{"STEPWISE_POLL_INTERVAL", &c.PollInterval},
+		{"STEPWISE_BACKOFF_BASE", &c.BackoffBase},
+		{"STEPWISE_BACKOFF_MAX", &c.BackoffMax},
 	}
 	for _, d := range durations {
 		v := os.Getenv(d.env)

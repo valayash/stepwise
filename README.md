@@ -12,7 +12,7 @@ go run ./cmd/stepwise dev      # open http://localhost:8080 — no API keys, no 
 
 ## Proof: the chaos test
 
-1,000 refund agents ran on 8 worker processes while a worker was **killed every ~120 ms with no graceful shutdown** (79 kills), with 5% of tool calls and 5% of model calls failing on top. Every run needed a human approval before refunding.
+1,000 refund agents ran on 8 separate `stepwise worker` processes sharing one Postgres database while a worker was **killed with `SIGKILL` every ~250 ms** — 375 kills, no graceful shutdown — with 5% of tool calls and 5% of model calls failing on top. Every run needed a human approval before refunding.
 
 | Check | Result |
 | --- | --- |
@@ -20,13 +20,17 @@ go run ./cmd/stepwise dev      # open http://localhost:8080 — no API keys, no 
 | Runs lost or stuck | **0** |
 | Refunds issued | **1,000** — exactly one per order |
 | Orders refunded twice | **0** |
-| Refund calls repeated after a crash, absorbed by idempotency keys | 35 |
+| Refund calls repeated after a crash, absorbed by idempotency keys | 38 |
 | Step histories with gaps or duplicates | **0** |
-| Model calls re-executed (the cost of crashing mid-call) | 9.6% |
+| Model calls re-executed (the cost of being killed mid-call) | 13% |
 
-Reproduce it: `go run ./cmd/chaos -runs 1000 -workers 8 -kill-every 120ms -latency 40ms -lease 300ms` · [full report](docs/chaos-report.md)
+Reproduce it against your own Postgres:
 
-The harness kills workers in-process: a killed worker's store connection fails every call from that instant and its in-flight requests are cut off, so its leases must expire before another worker can continue — the same observable behaviour as `kill -9`. A multi-process version against Postgres is on the roadmap.
+```bash
+go run ./cmd/chaos -db "$DATABASE_URL" -runs 1000 -workers 8 -kill-every 250ms -latency 40ms -lease 1s
+```
+
+Without `-db`, the harness runs in one process with an in-memory store and simulates the kills. [Full report](docs/chaos-report.md). CI runs both on every push.
 
 ## Why this exists
 
@@ -105,7 +109,7 @@ Details and trade-offs: [docs/DESIGN.md](docs/DESIGN.md).
 | **Observability** | Prometheus metrics at `/metrics`; structured JSON logs with run IDs; live run updates over SSE |
 | **Web UI** | Run list, step timeline with re-execution badges, approvals, cancel/retry — embedded, no build step |
 | **Gateway** | OpenAI-compatible `/v1/chat/completions` passthrough (streaming included) for plain LLM calls |
-| **Zero dependencies** | Standard library only |
+| **Minimal dependencies** | Standard library plus `pgx`, the Postgres driver |
 
 ## Quick start
 
@@ -115,6 +119,15 @@ go run ./cmd/stepwise dev
 ```
 
 Open http://localhost:8080 → **New run** → **Start**. Approve the refund when it asks.
+
+With Postgres (any version 14+):
+
+```bash
+docker run -d --name pg -e POSTGRES_PASSWORD=pw -p 5432:5432 postgres:16
+export STEPWISE_DATABASE_URL="postgres://postgres:pw@localhost:5432/postgres?sslmode=disable"
+go run ./cmd/stepwise serve            # API + UI + workers; migrations run on start
+go run ./cmd/stepwise worker           # in another terminal: more workers, same database
+```
 
 | Command | What it runs |
 | --- | --- |
@@ -169,17 +182,20 @@ Stepwise is a focused, self-hosted engine for one job — running tool-using age
 ## Testing
 
 ```bash
-make test        # unit + integration tests, race detector on
-make chaos       # the crash test above
+make test                                   # unit + integration tests, race detector on
+STEPWISE_TEST_DATABASE_URL=... make test    # also runs the Postgres store tests
+make chaos                                  # in-process crash test
+DATABASE_URL=... make chaos-pg              # multi-process SIGKILL test on Postgres
 ```
 
-The in-memory and Postgres stores share one **conformance suite** (leases, fencing, approvals, sub-agents, outbox, concurrent claims), so both must implement identical semantics. Engine tests cover the refund flow, crash-after-side-effect, transient retries, exhaustion → triage → approved retry, sub-agents, budgets, cancellation, rate limiting, graceful shutdown and a model inventing tools.
+The in-memory and Postgres stores share one **conformance suite** (leases, fencing, approvals, sub-agents, outbox, concurrent claims) and both pass it, so they implement identical semantics. Engine tests cover the refund flow, crash-after-side-effect, transient retries, exhaustion → triage → approved retry, sub-agents, budgets, cancellation, rate limiting, graceful shutdown and a model inventing tools.
 
 ## Status and roadmap
 
-- [x] Engine, in-memory store, API, UI, webhooks, MCP, triage, chaos test
-- [x] Postgres store (`database/sql`, embedded migrations, `SKIP LOCKED`, `LISTEN/NOTIFY` in transactions) — implemented and compiling
-- [ ] Wire a Postgres driver (`pgx`), run the conformance suite against a live database, and a multi-process `kill -9` chaos test
+- [x] Engine, in-memory store, API, UI, webhooks, MCP, triage
+- [x] Postgres store (`pgx`, embedded migrations, `SKIP LOCKED`, `LISTEN/NOTIFY` in transactions), passing the conformance suite
+- [x] Multi-process `SIGKILL` chaos test on Postgres, in CI
+- [ ] Docker Compose for Postgres + Stepwise
 - [ ] Redis-backed rate limiter for fleet-wide limits (today: per process)
 - [ ] OpenTelemetry traces (one trace per run, a span per step)
 

@@ -80,13 +80,13 @@ Because the decision depends only on saved state, a worker that resumes after a 
 
 **Execution guarantee:** steps are *at-least-once*; side effects are *effectively-once* when tools honour the idempotency key. A completed step is never executed again (`BeginStep` refuses it). Only the step that was in flight at the crash re-runs.
 
-**Cost:** model calls are not idempotent, so a crash during a model call pays for that call twice. The chaos test measures this: about 9.6% of model calls were re-executed with a worker killed every 120 ms — a deliberately extreme rate.
+**Cost:** model calls are not idempotent, so a crash during a model call pays for that call twice. The chaos test measures this: about 13% of model calls were re-executed with a worker process killed every 250 ms — a deliberately extreme rate.
 
 ## 6. Idempotency keys
 
 The key for a tool call is `run_id:tool_call_id`. The `tool_call_id` comes from the model's response, which is **saved before any tool runs**, so the ID never changes across retries or crashes. HTTP tools receive it as `Idempotency-Key`; MCP tools in `_meta["stepwise/idempotency_key"]`.
 
-The chaos test checks the full chain: 35 times a worker died after the shop issued a refund but before the worker saved the result. Each time, the next worker called again with the same key and the shop returned the original refund. 1,000 orders, 1,000 refunds.
+The chaos test checks the full chain. In the Postgres run (375 `SIGKILL`s), 38 times a worker died after the shop issued a refund but before the worker saved the result. Each time, the next worker called again with the same key and the shop returned the original refund. 1,000 orders, 1,000 refunds.
 
 ## 7. Human approvals and waiting
 
@@ -150,11 +150,10 @@ When a top-level run fails, Stepwise starts a **triage agent** with three built-
 - **Conformance suite** (`store/storetest`): 15 behaviours every store must pass — exclusive claims, lease expiry and fencing, resume semantics, approvals, sub-agent resolution, cancel cascades, the outbox, and 8 goroutines racing to claim 40 runs.
 - **Engine integration tests** with real HTTP and MCP: the refund flow, crash after a side effect, transient retries, exhaustion → triage → approved retry, sub-agents, budgets, cancellation, rate-limit deferral, graceful shutdown, invented tool names.
 - **Race detector** on every test, repeated runs for timing-sensitive tests (this found a real race in the in-memory store).
-- **Chaos harness** (`cmd/chaos`): kills, faults and verification of every invariant at the end.
+- **Chaos harness** (`cmd/chaos`): with `-db`, real `stepwise worker` OS processes on Postgres killed with `SIGKILL`; without it, in-process workers with simulated kills. Faults are injected on top and every invariant is verified at the end. Both run in CI.
 
 ## 14. Known limitations
 
-- The Postgres store is implemented but not yet wired to a driver in this build; the chaos test currently uses the in-memory store with simulated process death.
 - Rate limits are per process (Redis limiter planned).
 - Streaming is available in the gateway, not yet surfaced token-by-token for durable runs.
 - A crash during a model call re-pays for that call. Providers don't offer idempotent completions, so this is inherent; it is measured rather than hidden.
@@ -162,7 +161,7 @@ When a top-level run fails, Stepwise starts a **triage agent** with three built-
 ## 15. Interview questions this project answers
 
 **How do you guarantee a refund happens once if the worker can die at any time?**
-You can't make the call itself exactly-once across a crash, so make it at-least-once and idempotent. The tool call ID is saved with the model's response before any tool runs; the tool receives `run_id:tool_call_id` as its idempotency key; a retry with the same key returns the original result. The chaos test shows 35 such retries and zero double refunds.
+You can't make the call itself exactly-once across a crash, so make it at-least-once and idempotent. The tool call ID is saved with the model's response before any tool runs; the tool receives `run_id:tool_call_id` as its idempotency key; a retry with the same key returns the original result. The chaos test shows 38 such retries across 375 process kills and zero double refunds.
 
 **What happens if a worker freezes for a minute and then wakes up?**
 Its lease expired, another worker claimed the run with a higher fencing token, and every write from the frozen worker is rejected because its token no longer matches. It abandons the run.
@@ -180,7 +179,7 @@ A sleeping worker holds a slot doing nothing. Requeueing frees it for runs that 
 Consistent lock order: always child before parent. Cancel locks the tree deepest-first with a recursive CTE.
 
 **What does it cost to survive crashes?**
-Measured: about 9.6% extra model calls under a kill every 120 ms. Completed steps are never repeated.
+Measured: about 13% extra model calls with a worker process `SIGKILL`ed every 250 ms. Completed steps are never repeated.
 
 **What would you build next?**
-The `pgx` driver and a multi-process `kill -9` test against Postgres; a Redis token bucket so the whole fleet shares one limit; OpenTelemetry traces with a span per step.
+A Redis token bucket so the whole fleet shares one rate limit; OpenTelemetry traces with a span per step; partitioning the steps table by time for very large histories.

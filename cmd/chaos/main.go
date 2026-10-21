@@ -13,6 +13,8 @@ package main
 
 import (
 	"context"
+	crand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -22,11 +24,15 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/valayash/stepwise/internal/core"
@@ -35,6 +41,8 @@ import (
 	"github.com/valayash/stepwise/internal/provider"
 	"github.com/valayash/stepwise/internal/store"
 	"github.com/valayash/stepwise/internal/store/memory"
+	"github.com/valayash/stepwise/internal/store/postgres"
+	"github.com/valayash/stepwise/internal/store/postgres/pgxdriver"
 	"github.com/valayash/stepwise/internal/tools"
 )
 
@@ -50,10 +58,12 @@ func main() {
 		latency    = flag.Duration("latency", 15*time.Millisecond, "model and tool latency")
 		timeout    = flag.Duration("timeout", 5*time.Minute, "give up after")
 		out        = flag.String("out", "", "also write the report to this file")
+		db         = flag.String("db", "", "Postgres URL: run workers as separate OS processes and kill them with SIGKILL")
+		bin        = flag.String("bin", "", "stepwise binary for -db mode (built automatically if empty)")
 	)
 	flag.Parse()
 
-	rep, err := run(config{*runs, *workers, *perWorker, *killEvery, *lease, *toolFaults, *llmFaults, *latency, *timeout})
+	rep, err := run(config{*runs, *workers, *perWorker, *killEvery, *lease, *toolFaults, *llmFaults, *latency, *timeout, *db, *bin})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "chaos:", err)
 	}
@@ -72,6 +82,196 @@ type config struct {
 	killEvery, lease         time.Duration
 	toolFaults, llmFaults    float64
 	latency, timeout         time.Duration
+	db, bin                  string
+}
+
+// ---- worker fleets ----
+
+// fleet starts and kills worker processes.
+type fleet interface {
+	spawn() error
+	kill() bool // false when nothing was running
+	stopAll()
+}
+
+// goroutineFleet runs workers inside this process and simulates kill -9 by
+// cutting a worker's store connection at the instant of the kill.
+type goroutineFleet struct {
+	ctx    context.Context
+	base   store.Store
+	router *provider.Router
+	log    *slog.Logger
+	cfg    config
+
+	mu    sync.Mutex
+	procs []*goroutineProc
+	seq   int
+}
+
+type goroutineProc struct {
+	conn   *killable
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func (f *goroutineFleet) spawn() error {
+	f.mu.Lock()
+	f.seq++
+	id := f.seq
+	f.mu.Unlock()
+	conn := &killable{Store: f.base}
+	eng := engine.New(engine.Config{
+		WorkerID: fmt.Sprintf("proc-%d", id), Workers: f.cfg.perWorker, Lease: f.cfg.lease,
+		PollInterval: 30 * time.Millisecond, MaxAttempts: 10,
+		BackoffBase: 5 * time.Millisecond, BackoffMax: 50 * time.Millisecond,
+	}, engine.Deps{Store: conn, Router: f.router, Tools: tools.NewRunner(), Logger: f.log})
+	pctx, pcancel := context.WithCancel(f.ctx)
+	p := &goroutineProc{conn: conn, cancel: pcancel, done: make(chan struct{})}
+	go func() { eng.Run(pctx); close(p.done) }()
+	f.mu.Lock()
+	f.procs = append(f.procs, p)
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *goroutineFleet) kill() bool {
+	f.mu.Lock()
+	if len(f.procs) == 0 {
+		f.mu.Unlock()
+		return false
+	}
+	i := rand.IntN(len(f.procs))
+	p := f.procs[i]
+	f.procs = append(f.procs[:i], f.procs[i+1:]...)
+	f.mu.Unlock()
+	p.conn.dead.Store(true) // from now on, nothing this process does reaches the database
+	p.cancel()              // and its in-flight calls are cut off
+	return true
+}
+
+func (f *goroutineFleet) stopAll() {
+	f.mu.Lock()
+	procs := append([]*goroutineProc(nil), f.procs...)
+	f.procs = nil
+	f.mu.Unlock()
+	for _, p := range procs {
+		p.cancel()
+		<-p.done
+	}
+}
+
+// osFleet runs each worker as a real `stepwise worker` OS process and kills
+// it with SIGKILL: no deferred cleanup, no graceful release, open
+// transactions rolled back by Postgres when the connection drops.
+type osFleet struct {
+	bin string
+	env []string
+
+	mu    sync.Mutex
+	procs []*exec.Cmd
+}
+
+func (f *osFleet) spawn() error {
+	cmd := exec.Command(f.bin, "worker")
+	cmd.Env = append(os.Environ(), f.env...)
+	cmd.Stdout, cmd.Stderr = io.Discard, os.Stderr
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	f.procs = append(f.procs, cmd)
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *osFleet) kill() bool {
+	f.mu.Lock()
+	if len(f.procs) == 0 {
+		f.mu.Unlock()
+		return false
+	}
+	i := rand.IntN(len(f.procs))
+	cmd := f.procs[i]
+	f.procs = append(f.procs[:i], f.procs[i+1:]...)
+	f.mu.Unlock()
+	_ = cmd.Process.Signal(syscall.SIGKILL)
+	_ = cmd.Wait()
+	return true
+}
+
+func (f *osFleet) stopAll() {
+	f.mu.Lock()
+	procs := f.procs
+	f.procs = nil
+	f.mu.Unlock()
+	for _, cmd := range procs {
+		_ = cmd.Process.Signal(syscall.SIGTERM)
+		_ = cmd.Wait()
+	}
+}
+
+// openPostgres creates a fresh schema for this experiment and returns a
+// store on it, plus the URL worker processes should use.
+func openPostgres(ctx context.Context, base string) (store.Store, string, func(), error) {
+	admin, _, err := pgxdriver.Open(base)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	var b [5]byte
+	_, _ = crand.Read(b[:])
+	schema := "chaos_" + hex.EncodeToString(b[:])
+	if _, err := admin.ExecContext(ctx, `CREATE SCHEMA `+schema); err != nil {
+		admin.Close()
+		return nil, "", nil, err
+	}
+	u, err := url.Parse(base)
+	if err != nil {
+		admin.Close()
+		return nil, "", nil, err
+	}
+	q := u.Query()
+	q.Set("search_path", schema)
+	u.RawQuery = q.Encode()
+	dbURL := u.String()
+
+	db, listener, err := pgxdriver.Open(dbURL)
+	if err != nil {
+		admin.Close()
+		return nil, "", nil, err
+	}
+	if err := postgres.Migrate(ctx, db); err != nil {
+		db.Close()
+		admin.Close()
+		return nil, "", nil, err
+	}
+	st, err := postgres.New(db, listener)
+	if err != nil {
+		db.Close()
+		admin.Close()
+		return nil, "", nil, err
+	}
+	cleanup := func() {
+		_ = st.Close()
+		db.Close()
+		_, _ = admin.Exec(`DROP SCHEMA ` + schema + ` CASCADE`)
+		admin.Close()
+	}
+	return st, dbURL, cleanup, nil
+}
+
+// buildBinary compiles cmd/stepwise into a temporary directory.
+func buildBinary() (string, error) {
+	dir, err := os.MkdirTemp("", "stepwise-chaos-")
+	if err != nil {
+		return "", err
+	}
+	bin := filepath.Join(dir, "stepwise")
+	out, err := exec.Command("go", "build", "-o", bin, "./cmd/stepwise").CombinedOutput()
+	if err != nil {
+		os.RemoveAll(dir)
+		return "", fmt.Errorf("build stepwise: %v\n%s", err, out)
+	}
+	return bin, nil
 }
 
 // ---- a store connection that dies like a killed process ----
@@ -178,9 +378,14 @@ func (r *report) markdown() string {
 	}
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "## Chaos test: %s\n\n", verdict)
+	how := "in-process workers, killed by cutting their store connection (simulated kill -9), in-memory store"
+	if r.cfg.db != "" {
+		how = "separate `stepwise worker` OS processes killed with SIGKILL, Postgres store"
+	}
 	fmt.Fprintf(&sb, "%d refund-agent runs (7 steps each, one human approval) on %d worker processes × %d concurrent runs, "+
-		"%.0f%% injected tool failures, %.0f%% injected model failures, a worker killed every ~%s with no graceful shutdown.\n\n",
-		r.cfg.runs, r.cfg.workers, r.cfg.perWorker, r.cfg.toolFaults*100, r.cfg.llmFaults*100, r.cfg.killEvery)
+		"%.0f%% injected tool failures, %.0f%% injected model failures, a worker killed every ~%s with no graceful shutdown.\n\n"+
+		"Mode: %s.\n\n",
+		r.cfg.runs, r.cfg.workers, r.cfg.perWorker, r.cfg.toolFaults*100, r.cfg.llmFaults*100, r.cfg.killEvery, how)
 	fmt.Fprintf(&sb, "| Check | Result |\n| --- | --- |\n")
 	fmt.Fprintf(&sb, "| Runs completed | **%d / %d** |\n", r.completed, r.cfg.runs)
 	fmt.Fprintf(&sb, "| Runs lost or stuck | **%d** |\n", r.cfg.runs-r.completed-r.failed)
@@ -230,7 +435,29 @@ func run(cfg config) (*report, error) {
 	defer cancel()
 
 	// Shared infrastructure: the store, the shop, the model.
-	base := memory.New(nil)
+	var (
+		base  store.Store
+		dbURL string
+	)
+	if cfg.db != "" {
+		var cleanup func()
+		var err error
+		base, dbURL, cleanup, err = openPostgres(ctx, cfg.db)
+		if err != nil {
+			return rep, err
+		}
+		defer cleanup()
+		if cfg.bin == "" {
+			bin, err := buildBinary()
+			if err != nil {
+				return rep, err
+			}
+			defer os.RemoveAll(filepath.Dir(bin))
+			cfg.bin = bin
+		}
+	} else {
+		base = memory.New(nil)
+	}
 	shop := demo.NewShop(time.Now())
 	shop.Latency = cfg.latency
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -287,49 +514,35 @@ func run(cfg config) (*report, error) {
 	}()
 
 	// Worker processes.
-	type proc struct {
-		conn   *killable
-		cancel context.CancelFunc
-		done   chan struct{}
+	var fl fleet
+	if cfg.db != "" {
+		fl = &osFleet{bin: cfg.bin, env: []string{
+			"STEPWISE_DATABASE_URL=" + dbURL,
+			fmt.Sprintf("STEPWISE_WORKERS=%d", cfg.perWorker),
+			"STEPWISE_LEASE=" + cfg.lease.String(),
+			"STEPWISE_MAX_ATTEMPTS=10",
+			"STEPWISE_POLL_INTERVAL=30ms",
+			"STEPWISE_BACKOFF_BASE=5ms",
+			"STEPWISE_BACKOFF_MAX=50ms",
+			"STEPWISE_MOCK_LATENCY=" + cfg.latency.String(),
+			fmt.Sprintf("STEPWISE_MOCK_FAIL_RATE=%g", cfg.llmFaults),
+			"STEPWISE_TRIAGE=false",
+			"STEPWISE_LOG_LEVEL=error",
+		}}
+	} else {
+		fl = &goroutineFleet{ctx: ctx, base: base, router: router, log: quiet, cfg: cfg}
 	}
-	var (
-		mu    sync.Mutex
-		procs []*proc
-		seq   int
-	)
 	spawn := func() {
-		mu.Lock()
-		seq++
-		id := seq
-		mu.Unlock()
-		conn := &killable{Store: base}
-		runner := tools.NewRunner()
-		eng := engine.New(engine.Config{
-			WorkerID: fmt.Sprintf("proc-%d", id), Workers: cfg.perWorker, Lease: cfg.lease,
-			PollInterval: 30 * time.Millisecond, MaxAttempts: 10,
-			BackoffBase: 5 * time.Millisecond, BackoffMax: 50 * time.Millisecond,
-		}, engine.Deps{Store: conn, Router: router, Tools: runner, Logger: quiet})
-		pctx, pcancel := context.WithCancel(ctx)
-		p := &proc{conn: conn, cancel: pcancel, done: make(chan struct{})}
-		go func() { eng.Run(pctx); close(p.done) }()
-		mu.Lock()
-		procs = append(procs, p)
-		rep.spawned++
-		mu.Unlock()
-	}
-	kill := func() {
-		mu.Lock()
-		if len(procs) == 0 {
-			mu.Unlock()
+		if err := fl.spawn(); err != nil {
+			fmt.Fprintln(os.Stderr, "chaos: spawn:", err)
 			return
 		}
-		i := rand.IntN(len(procs))
-		p := procs[i]
-		procs = append(procs[:i], procs[i+1:]...)
-		rep.kills++
-		mu.Unlock()
-		p.conn.dead.Store(true) // from now on, nothing this process does reaches the database
-		p.cancel()              // and its in-flight calls are cut off
+		rep.spawned++
+	}
+	kill := func() {
+		if fl.kill() {
+			rep.kills++
+		}
 	}
 	for i := 0; i < cfg.workers; i++ {
 		spawn()
@@ -371,15 +584,7 @@ func run(cfg config) (*report, error) {
 	rep.duration = time.Since(start)
 	close(allDone)
 	<-killerDone
-	mu.Lock()
-	for _, p := range procs {
-		p.cancel()
-	}
-	alive := append([]*proc(nil), procs...)
-	mu.Unlock()
-	for _, p := range alive {
-		<-p.done
-	}
+	fl.stopAll()
 
 	// ---- verify ----
 	bg := context.Background()

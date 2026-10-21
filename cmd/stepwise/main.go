@@ -118,6 +118,7 @@ func run(ctx context.Context, log *slog.Logger, cfg config.Config, r roles) erro
 
 	eng := engine.New(engine.Config{
 		Workers: cfg.Workers, Lease: cfg.Lease, MaxAttempts: cfg.MaxAttempts,
+		PollInterval: cfg.PollInterval, BackoffBase: cfg.BackoffBase, BackoffMax: cfg.BackoffMax,
 		Triage: engine.TriageConfig{Enabled: cfg.TriageEnabled, Model: cfg.TriageModel, AutoRetry: cfg.TriageAutoRetry},
 	}, engine.Deps{
 		Store: st, Router: router, Tools: runner, Limiter: limiter, Breakers: breakers,
