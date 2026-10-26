@@ -46,8 +46,7 @@ tools     → core, mcp, telemetry
 webhook   → store, breaker, metrics
 engine    → core, store, tools, provider, ratelimit, breaker, metrics, telemetry   (the orchestrator)
 api       → core, store, tools, provider
-gateway   → api, provider       ✗ only uses OpenAI wire types that live in api/types.go
-config    → ratelimit           ✗ a settings loader shouldn't depend on a feature package
+gateway   → provider            (owns its OpenAI wire types)
 cmd/*     → everything          (wiring only)
 ```
 
