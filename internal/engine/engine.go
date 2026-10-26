@@ -144,6 +144,19 @@ func (e *Engine) Run(ctx context.Context) {
 		}
 	}()
 
+	go func() {
+		t := time.NewTicker(30 * e.cfg.PollInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				e.expireApprovals(ctx)
+			}
+		}
+	}()
+
 	var wg sync.WaitGroup
 	for i := 0; i < e.cfg.Workers; i++ {
 		wg.Add(1)
@@ -155,6 +168,33 @@ func (e *Engine) Run(ctx context.Context) {
 	e.log.Info("engine started", "workers", e.cfg.Workers, "lease", e.cfg.Lease)
 	wg.Wait()
 	e.log.Info("engine stopped")
+}
+
+// expireApprovals rejects tool calls that waited longer than their agent's
+// approval_timeout. Every worker process sweeps; a call already decided by
+// another one is simply skipped.
+func (e *Engine) expireApprovals(ctx context.Context) {
+	steps, err := e.store.PendingApprovals(ctx)
+	if err != nil {
+		return
+	}
+	ttl := map[string]time.Duration{}
+	for _, st := range steps {
+		d, ok := ttl[st.RunID]
+		if !ok {
+			if run, err := e.store.GetRun(ctx, st.RunID); err == nil {
+				d = run.Spec.ApprovalTTL()
+			}
+			ttl[st.RunID] = d
+		}
+		if d <= 0 || e.now().Sub(st.CreatedAt) < d {
+			continue
+		}
+		note := fmt.Sprintf("No decision within %s; rejected automatically.", d)
+		if e.store.DecideApproval(ctx, st.RunID, st.ID, core.Approval{Note: note, DecidedBy: "stepwise"}) == nil {
+			e.m.approvals.Inc("expired")
+		}
+	}
 }
 
 func (e *Engine) workerLoop(ctx context.Context, wake <-chan struct{}) {

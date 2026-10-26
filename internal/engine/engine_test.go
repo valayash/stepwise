@@ -191,6 +191,18 @@ func TestRejectedApprovalIsReportedToTheModel(t *testing.T) {
 // A worker issues the refund and dies before saving the result. The next
 // worker re-executes the step with the same idempotency key, and the shop
 // returns the original refund instead of paying twice.
+func TestUnansweredApprovalExpires(t *testing.T) {
+	h := newHarness(t)
+	h.start()
+	spec := shopSpec(h.shopMC, "issue_refund")
+	spec.ApprovalTimeout = "10ms"
+	run := h.create(spec, refundPrompt, 0)
+	done := h.waitStatus(run.ID, core.RunCompleted) // nobody decides; the sweep rejects it
+	if h.shop.Stats().RefundsIssued != 0 || !strings.Contains(done.Output, "rejected automatically") {
+		t.Errorf("refunds %d, output %q", h.shop.Stats().RefundsIssued, done.Output)
+	}
+}
+
 func TestCrashAfterSideEffectIsExactlyOnce(t *testing.T) {
 	h := newHarness(t)
 	spec, _ := h.runner.Prepare(context.Background(), core.AgentSpec{Model: "mock", Tools: []core.ToolSpec{{Type: core.ToolMCP, URL: h.shopMC, Include: []string{"issue_refund"}}}})

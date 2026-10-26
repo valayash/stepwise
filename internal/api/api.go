@@ -381,24 +381,24 @@ type pendingApproval struct {
 
 // approvals lists every tool call waiting for a human: an inbox.
 func (s *Server) approvals(_ http.ResponseWriter, r *http.Request) (any, error) {
-	runs, err := s.Store.ListRuns(r.Context(), store.ListFilter{Status: core.RunWaiting, Limit: 500})
+	steps, err := s.Store.PendingApprovals(r.Context())
 	if err != nil {
 		return nil, err
 	}
 	out := []pendingApproval{}
-	for _, run := range runs {
-		steps, err := s.Store.ListSteps(r.Context(), run.ID)
-		if err != nil {
-			continue
-		}
-		for _, st := range steps {
-			if st.Status == core.StepPendingApproval {
-				out = append(out, pendingApproval{
-					RunID: run.ID, StepID: st.ID, ToolName: st.ToolName, ToolInput: st.ToolInput,
-					Input: run.Input, Waiting: time.Since(st.CreatedAt), CreatedAt: st.CreatedAt,
-				})
+	runs := map[string]core.Run{}
+	for _, st := range steps {
+		run, ok := runs[st.RunID]
+		if !ok {
+			if run, err = s.Store.GetRun(r.Context(), st.RunID); err != nil {
+				continue
 			}
+			runs[st.RunID] = run
 		}
+		out = append(out, pendingApproval{
+			RunID: run.ID, StepID: st.ID, ToolName: st.ToolName, ToolInput: st.ToolInput,
+			Input: run.Input, Waiting: time.Since(st.CreatedAt), CreatedAt: st.CreatedAt,
+		})
 	}
 	return map[string]any{"approvals": out}, nil
 }

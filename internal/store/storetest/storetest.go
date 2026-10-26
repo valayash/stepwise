@@ -248,8 +248,14 @@ func testApprovalFlow(t *testing.T, s store.Store) {
 	if len(ds) != 1 || ds[0].Event != core.EventApprovalRequested {
 		t.Errorf("approval webhook not queued: %+v", ds)
 	}
+	if p, err := s.PendingApprovals(ctx); err != nil || len(p) != 1 || p[0].ID != st.ID || p[0].RunID != r.ID {
+		t.Errorf("pending approvals = %+v %v", p, err)
+	}
 	if err := s.DecideApproval(ctx, r.ID, st.ID, core.Approval{Approved: true, DecidedBy: "ops"}); err != nil {
 		t.Fatal(err)
+	}
+	if p, _ := s.PendingApprovals(ctx); len(p) != 0 {
+		t.Errorf("decided call still pending: %+v", p)
 	}
 	if err := s.DecideApproval(ctx, r.ID, st.ID, core.Approval{Approved: true}); !errors.Is(err, core.ErrNotRunnable) {
 		t.Errorf("double decision: %v", err)

@@ -106,10 +106,13 @@ type AgentSpec struct {
 	RequireApproval []string   `json:"require_approval,omitempty"` // tool names that need a human OK
 	// Limits caps how many times a tool may be called per run, e.g. {"issue_refund": 1}.
 	// Extra calls are returned to the model as errors.
-	Limits           map[string]int `json:"limits,omitempty"`
-	MaxTurns         int            `json:"max_turns,omitempty"` // LLM calls per run, default 20
-	MaxTokensPerCall int            `json:"max_tokens_per_call,omitempty"`
-	Temperature      *float64       `json:"temperature,omitempty"`
+	Limits map[string]int `json:"limits,omitempty"`
+	// ApprovalTimeout (e.g. "24h") rejects a tool call nobody approved in time;
+	// the model is told and can finish without it. Empty waits forever.
+	ApprovalTimeout  string   `json:"approval_timeout,omitempty"`
+	MaxTurns         int      `json:"max_turns,omitempty"` // LLM calls per run, default 20
+	MaxTokensPerCall int      `json:"max_tokens_per_call,omitempty"`
+	Temperature      *float64 `json:"temperature,omitempty"`
 }
 
 // Defaults applied when a spec leaves a limit unset.
@@ -148,6 +151,12 @@ func (a AgentSpec) NeedsApproval(name string) bool {
 		}
 	}
 	return false
+}
+
+// ApprovalTTL is ApprovalTimeout as a duration (0 = wait forever).
+func (a AgentSpec) ApprovalTTL() time.Duration {
+	d, _ := time.ParseDuration(a.ApprovalTimeout)
+	return d
 }
 
 // ToolDefs converts the spec's tools into the provider-neutral definitions sent to the model.

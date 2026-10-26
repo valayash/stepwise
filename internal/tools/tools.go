@@ -261,6 +261,9 @@ func (r *Runner) prepare(ctx context.Context, spec core.AgentSpec, depth int) (c
 			return spec, fmt.Errorf("%w: require_approval names unknown tool %q", core.ErrInvalid, n)
 		}
 	}
+	if d, err := time.ParseDuration(spec.ApprovalTimeout); spec.ApprovalTimeout != "" && (err != nil || d <= 0) {
+		return spec, fmt.Errorf("%w: approval_timeout must be a positive duration like 24h", core.ErrInvalid)
+	}
 	for n, max := range spec.Limits {
 		if !seen[n] || max < 1 {
 			return spec, fmt.Errorf("%w: limits[%q] must name a tool and be at least 1", core.ErrInvalid, n)

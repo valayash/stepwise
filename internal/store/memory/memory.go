@@ -436,6 +436,22 @@ func (m *Store) outbox(r *core.Run, event string, step *core.Step, now time.Time
 
 // ---- humans ----
 
+// PendingApprovals implements store.Store.
+func (m *Store) PendingApprovals(_ context.Context) ([]core.Step, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []core.Step
+	for _, steps := range m.steps {
+		for _, s := range steps {
+			if s.Status == core.StepPendingApproval {
+				out = append(out, clone(s))
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out, nil
+}
+
 // DecideApproval implements store.Store.
 func (m *Store) DecideApproval(_ context.Context, runID string, stepID int64, a core.Approval) error {
 	return m.write(func(now time.Time) ([]store.Event, error) {

@@ -58,6 +58,8 @@ type Store interface {
 	// ---- humans ----
 
 	DecideApproval(ctx context.Context, runID string, stepID int64, a core.Approval) error
+	// PendingApprovals lists every tool call waiting for a human, oldest first.
+	PendingApprovals(ctx context.Context) ([]core.Step, error)
 	Cancel(ctx context.Context, runID string) error
 	// Retry puts a failed run back in the queue with a fresh retry counter.
 	Retry(ctx context.Context, runID string) error

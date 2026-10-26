@@ -761,6 +761,12 @@ func finishTx(ctx context.Context, tx *sql.Tx, r core.Run, o store.Outcome) erro
 
 // ---- humans ----
 
+// PendingApprovals implements store.Store.
+func (s *Store) PendingApprovals(ctx context.Context) ([]core.Step, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+stepCols+` FROM steps WHERE status = 'pending_approval' ORDER BY created_at`)
+	return scanAll(rows, err, scanStep)
+}
+
 // DecideApproval implements store.Store.
 func (s *Store) DecideApproval(ctx context.Context, runID string, stepID int64, a core.Approval) error {
 	return s.inTx(ctx, func(tx *sql.Tx) error {

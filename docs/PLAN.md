@@ -82,7 +82,7 @@ Core means: agents run reliably, safely and cheaply, and results are usable. No 
       returned to the model as errors, like unknown tools.
 - [x] **Tool host allowlist.** Optional `STEPWISE_ALLOWED_TOOL_HOSTS`: tools may only call
       these hosts, so a spec can't reach internal addresses.
-- [ ] **Approval expiry.** `"approval_timeout": "24h"` on the agent: unanswered approvals are
+- [x] **Approval expiry.** `"approval_timeout": "24h"` on the agent: unanswered approvals are
       auto-rejected and the model is told why.
 - [ ] **Structured output.** An optional `response_schema` on the agent makes the final answer
       JSON matching the schema, stored in the existing `output` column.

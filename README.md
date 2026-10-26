@@ -100,7 +100,7 @@ Details and trade-offs: [docs/DESIGN.md](docs/DESIGN.md).
 | **Crash-safe execution** | Steps persisted before the next starts; replay on resume; leases + fencing tokens against zombie workers |
 | **Exactly-once side effects** | Stable idempotency key per tool call (`Idempotency-Key` header for HTTP tools, `_meta` for MCP) |
 | **Tools** | HTTP tools, any **MCP** server (Streamable HTTP; tools discovered with `tools/list`), and sub-agents; per-tool `headers` with `${STEPWISE_SECRET_*}` references for auth |
-| **Human-in-the-loop** | `require_approval` per tool; approve or reject via API or UI; rejections are shown to the model so it can adapt |
+| **Human-in-the-loop** | `require_approval` per tool; approve or reject via API or UI; rejections are shown to the model so it can adapt; `approval_timeout` (e.g. `"24h"`) rejects calls nobody answered |
 | **Sub-agents** | A tool can be another agent; children run in parallel as durable runs; tokens roll up to the parent's budget |
 | **Self-healing triage** | When a run fails, a triage agent reads it, records a diagnosis, and asks (with approval) to retry transient failures |
 | **Provider resilience** | Token-bucket rate limits (RPM + TPM) shared by every worker through Redis, circuit breaker per provider, retries with jittered exponential backoff, `Retry-After` support |
