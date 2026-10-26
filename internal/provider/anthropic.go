@@ -85,16 +85,34 @@ type anthropicRequest struct {
 	Tools       []anthropicTool    `json:"tools,omitempty"`
 	Temperature *float64           `json:"temperature,omitempty"`
 	Stream      bool               `json:"stream,omitempty"`
+	// CacheControl turns on automatic prompt caching: the breakpoint moves to
+	// the end of the conversation each turn, so an agent loop re-reads its
+	// growing history from cache instead of paying full price again.
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
+}
+
+type anthropicCacheControl struct {
+	Type string `json:"type"`
+}
+
+type anthropicUsage struct {
+	InputTokens              int `json:"input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+}
+
+// prompt is the whole prompt size: with caching, input_tokens is only the
+// uncached remainder, and budgets and rate limits must see all of it.
+func (u anthropicUsage) prompt() int {
+	return u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
 }
 
 type anthropicResponse struct {
 	ID         string           `json:"id"`
 	StopReason string           `json:"stop_reason"`
 	Content    []anthropicBlock `json:"content"`
-	Usage      struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
-	} `json:"usage"`
+	Usage      anthropicUsage   `json:"usage"`
 }
 
 // toAnthropicMessages converts neutral messages into Anthropic's shape:
@@ -152,10 +170,8 @@ func jsonObject(raw json.RawMessage) json.RawMessage {
 type anthropicStreamEvent struct {
 	Type    string `json:"type"`
 	Message struct {
-		ID    string `json:"id"`
-		Usage struct {
-			InputTokens int `json:"input_tokens"`
-		} `json:"usage"`
+		ID    string         `json:"id"`
+		Usage anthropicUsage `json:"usage"`
 	} `json:"message"` // message_start
 	Delta struct {
 		Type       string `json:"type"`
@@ -198,7 +214,8 @@ func (a *Anthropic) Complete(ctx context.Context, req Request) (Response, error)
 		Content:      text.String(),
 		ToolCalls:    calls,
 		FinishReason: mapAnthropicStop(ar.StopReason),
-		InputTokens:  ar.Usage.InputTokens,
+		InputTokens:  ar.Usage.prompt(),
+		CachedTokens: ar.Usage.CacheReadInputTokens,
 		OutputTokens: ar.Usage.OutputTokens,
 	}, nil
 }
@@ -220,7 +237,7 @@ func (a *Anthropic) Stream(ctx context.Context, req Request, onDelta DeltaFunc) 
 		switch ev.Type {
 		case "message_start":
 			out.ID = ev.Message.ID
-			out.InputTokens = ev.Message.Usage.InputTokens
+			out.InputTokens, out.CachedTokens = ev.Message.Usage.prompt(), ev.Message.Usage.CacheReadInputTokens
 		case "content_block_delta":
 			if ev.Delta.Type == "text_delta" && ev.Delta.Text != "" {
 				return false, onDelta(ev.Delta.Text)
@@ -243,10 +260,11 @@ func (a *Anthropic) Stream(ctx context.Context, req Request, onDelta DeltaFunc) 
 // On success the caller owns resp.Body.
 func (a *Anthropic) send(ctx context.Context, req Request, stream bool) (*http.Response, error) {
 	body := anthropicRequest{
-		Model:       req.Model,
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
-		Stream:      stream,
+		Model:        req.Model,
+		MaxTokens:    req.MaxTokens,
+		Temperature:  req.Temperature,
+		Stream:       stream,
+		CacheControl: &anthropicCacheControl{Type: "ephemeral"},
 	}
 	if body.MaxTokens <= 0 {
 		body.MaxTokens = anthropicDefaultMax

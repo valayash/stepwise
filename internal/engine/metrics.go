@@ -35,7 +35,7 @@ func NewMetrics(reg *metrics.Registry, breakers *breaker.Set) *Metrics {
 		llmSeconds:      reg.NewHistogramVec("stepwise_llm_call_seconds", "Model call latency.", nil, "provider"),
 		toolCalls:       reg.NewCounterVec("stepwise_tool_calls_total", "Tool calls by type and outcome.", "type", "outcome"),
 		toolSeconds:     reg.NewHistogramVec("stepwise_tool_call_seconds", "Tool call latency.", nil, "type"),
-		tokens:          reg.NewCounterVec("stepwise_llm_tokens_total", "Tokens used, by model and direction.", "model", "direction"),
+		tokens:          reg.NewCounterVec("stepwise_llm_tokens_total", "Tokens used, by model and direction (cached_input is the part of input served from the provider's cache).", "model", "direction"),
 		rateLimited:     reg.NewCounterVec("stepwise_rate_limited_total", "Model calls deferred by the shared rate limiter.", "model"),
 		breakerRejected: reg.NewCounterVec("stepwise_breaker_rejected_total", "Model calls deferred because a circuit was open.", "provider"),
 		retries:         reg.NewCounterVec("stepwise_retries_total", "Runs handed back for a retry, by reason.", "reason"),

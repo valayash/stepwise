@@ -52,8 +52,9 @@ type Response struct {
 	ID           string     `json:"id"`
 	Content      string     `json:"content,omitempty"`
 	ToolCalls    []ToolCall `json:"tool_calls,omitempty"`
-	FinishReason string     `json:"finish_reason"` // OpenAI vocabulary: "stop", "length", "tool_calls"
-	InputTokens  int        `json:"input_tokens"`
+	FinishReason string     `json:"finish_reason"`           // OpenAI vocabulary: "stop", "length", "tool_calls"
+	InputTokens  int        `json:"input_tokens"`            // the whole prompt, cached or not
+	CachedTokens int        `json:"cached_tokens,omitempty"` // part of InputTokens read from the provider's cache
 	OutputTokens int        `json:"output_tokens"`
 }
 

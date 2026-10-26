@@ -76,7 +76,7 @@ Core means: agents run reliably, safely and cheaply, and results are usable. No 
 
 - [x] **Spend limit.** Optional `STEPWISE_MONTHLY_TOKEN_LIMIT`: new runs are rejected once this
       month's token usage passes it. Usage also exposed as `GET /v1/usage`.
-- [ ] **Prompt caching.** Anthropic `cache_control` on the system prompt, tools and latest
+- [x] **Prompt caching.** Anthropic `cache_control` on the system prompt, tools and latest
       message, so each turn doesn't pay full price for the conversation again.
 - [ ] **Per-tool call limits.** `"limits": {"issue_refund": 1}` on the agent; extra calls are
       returned to the model as errors, like unknown tools.

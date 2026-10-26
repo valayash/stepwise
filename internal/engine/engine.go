@@ -369,6 +369,7 @@ func (x *execution) callLLM(ctx context.Context, seq int) error {
 		attribute.String("gen_ai.response.id", resp.ID),
 		attribute.StringSlice("gen_ai.response.finish_reasons", []string{resp.FinishReason}),
 		attribute.Int("gen_ai.usage.input_tokens", resp.InputTokens),
+		attribute.Int("gen_ai.usage.cache_read_input_tokens", resp.CachedTokens),
 		attribute.Int("gen_ai.usage.output_tokens", resp.OutputTokens),
 		attribute.Int("stepwise.tool_calls", len(resp.ToolCalls)),
 	)
@@ -395,6 +396,7 @@ func (x *execution) callLLM(ctx context.Context, seq int) error {
 	x.e.m.llmCalls.Inc(p.Name(), "ok")
 	x.e.m.tokens.Add(float64(resp.InputTokens), model, "input")
 	x.e.m.tokens.Add(float64(resp.OutputTokens), model, "output")
+	x.e.m.tokens.Add(float64(resp.CachedTokens), model, "cached_input") // part of input; watch it to confirm caching works
 
 	step.Status = core.StepCompleted
 	step.LLM = &resp
