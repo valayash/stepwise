@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/valayash/stepwise/internal/provider"
@@ -224,7 +225,7 @@ func (s Step) IdempotencyKey() string {
 	if s.ToolCallID != "" {
 		return s.RunID + ":" + s.ToolCallID
 	}
-	return s.RunID + ":step:" + itoa(s.Seq)
+	return s.RunID + ":step:" + strconv.Itoa(s.Seq)
 }
 
 // Tokens is the step's LLM token usage.
@@ -245,6 +246,14 @@ type NewRun struct {
 	IdempotencyKey string          `json:"idempotency_key,omitempty"`
 	ParentRunID    string          `json:"-"`
 	ParentStepID   int64           `json:"-"`
+}
+
+// Budget is the run's token budget, or the default when none was set.
+func (nr NewRun) Budget() int {
+	if nr.BudgetTokens > 0 {
+		return nr.BudgetTokens
+	}
+	return DefaultBudgetTokens
 }
 
 // Fence identifies a worker's claim on a run. Every write a worker makes
@@ -280,26 +289,4 @@ func NewID() string {
 	var b [16]byte
 	_, _ = rand.Read(b[:])
 	return hex.EncodeToString(b[:])
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var buf [20]byte
-	i := len(buf)
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
 }
