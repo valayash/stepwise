@@ -6,8 +6,9 @@
 #   http://localhost:16686   Jaeger: one trace per run
 #   http://localhost:9090    Prometheus
 #
-# One API process plus two worker processes share Postgres (state and queue)
-# and Redis (rate limits). Scale workers with `--scale worker=5`.
+# API, workers and the webhook dispatcher run as separate services. They share
+# only Postgres (state and queue) and Redis (rate limits). Scale any of them,
+# e.g. `--scale worker=5`.
 
 x-stepwise-env: &stepwise-env
   STEPWISE_DATABASE_URL: postgres://stepwise:stepwise@postgres:5432/stepwise?sslmode=disable
@@ -82,6 +83,15 @@ services:
       replicas: 2
     depends_on:
       stepwise: { condition: service_healthy } # the API runs migrations first
+
+  webhooks:
+    build: .
+    command: ["webhooks"]
+    environment:
+      <<: *stepwise-env
+      STEPWISE_METRICS_ADDR: ":9091"
+    depends_on:
+      stepwise: { condition: service_healthy }
 
 volumes:
   pgdata:

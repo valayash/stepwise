@@ -6,8 +6,6 @@ import (
 	"os"
 	"strconv"
 	"time"
-
-	"github.com/valayash/stepwise/internal/ratelimit"
 )
 
 // Config is the runtime configuration. Every field maps to one variable.
@@ -30,13 +28,13 @@ type Config struct {
 	MockFailRate    float64       // STEPWISE_MOCK_FAIL_RATE, 0..1 simulated outages
 
 	// Engine.
-	Workers      int             // STEPWISE_WORKERS, concurrent runs per process, default 8
-	Lease        time.Duration   // STEPWISE_LEASE, default 30s
-	MaxAttempts  int             // STEPWISE_MAX_ATTEMPTS, tries per step, default 6
-	PollInterval time.Duration   // STEPWISE_POLL_INTERVAL, idle polling, default 1s
-	BackoffBase  time.Duration   // STEPWISE_BACKOFF_BASE, first retry delay, default 1s
-	BackoffMax   time.Duration   // STEPWISE_BACKOFF_MAX, retry delay cap, default 2m
-	RateLimits   ratelimit.Rules // STEPWISE_RATE_LIMITS, e.g. "claude-=rpm:50,tpm:40000"
+	Workers      int           // STEPWISE_WORKERS, concurrent runs per process, default 8
+	Lease        time.Duration // STEPWISE_LEASE, default 30s
+	MaxAttempts  int           // STEPWISE_MAX_ATTEMPTS, tries per step, default 6
+	PollInterval time.Duration // STEPWISE_POLL_INTERVAL, idle polling, default 1s
+	BackoffBase  time.Duration // STEPWISE_BACKOFF_BASE, first retry delay, default 1s
+	BackoffMax   time.Duration // STEPWISE_BACKOFF_MAX, retry delay cap, default 2m
+	RateLimits   string        // STEPWISE_RATE_LIMITS, e.g. "claude-=rpm:50,tpm:40000"
 
 	// Webhooks and triage.
 	WebhookSecret   string // STEPWISE_WEBHOOK_SECRET; signs deliveries
@@ -53,6 +51,7 @@ func Load() (Config, error) {
 		Addr:            getenv("STEPWISE_ADDR", ":8080"),
 		DatabaseURL:     os.Getenv("STEPWISE_DATABASE_URL"),
 		RedisURL:        os.Getenv("STEPWISE_REDIS_URL"),
+		RateLimits:      os.Getenv("STEPWISE_RATE_LIMITS"),
 		MetricsAddr:     os.Getenv("STEPWISE_METRICS_ADDR"),
 		DemoShopURL:     os.Getenv("STEPWISE_DEMO_SHOP_URL"),
 		APIToken:        os.Getenv("STEPWISE_API_TOKEN"),
@@ -134,13 +133,6 @@ func Load() (Config, error) {
 			}
 			*dst = b
 		}
-	}
-	if v := os.Getenv("STEPWISE_RATE_LIMITS"); v != "" {
-		rules, err := ratelimit.ParseRules(v)
-		if err != nil {
-			return Config{}, fmt.Errorf("STEPWISE_RATE_LIMITS: %w", err)
-		}
-		c.RateLimits = rules
 	}
 	if c.TriageModel == "" {
 		c.TriageModel = "mock"

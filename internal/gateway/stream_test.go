@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/valayash/stepwise/internal/api"
 	"github.com/valayash/stepwise/internal/provider"
 )
 
@@ -29,9 +28,9 @@ func readEvents(t *testing.T, body string) []string {
 	return out
 }
 
-func decodeChunk(t *testing.T, data string) api.ChatCompletionChunk {
+func decodeChunk(t *testing.T, data string) ChatCompletionChunk {
 	t.Helper()
-	var c api.ChatCompletionChunk
+	var c ChatCompletionChunk
 	if err := json.Unmarshal([]byte(data), &c); err != nil {
 		t.Fatalf("chunk %q: %v", data, err)
 	}
@@ -62,7 +61,7 @@ func TestStreamHappyPath(t *testing.T) {
 
 	var text strings.Builder
 	var finish string
-	var usage *api.Usage
+	var usage *Usage
 	for _, e := range events[1 : len(events)-1] {
 		c := decodeChunk(t, e)
 		if c.ID != first.ID {
@@ -126,7 +125,7 @@ func TestStreamErrorMidStream(t *testing.T) {
 	if last == "[DONE]" {
 		t.Fatal("an interrupted stream must not end with [DONE]")
 	}
-	var er api.ErrorResponse
+	var er ErrorResponse
 	if err := json.Unmarshal([]byte(last), &er); err != nil || er.Error.Code != "stream_interrupted" {
 		t.Fatalf("last event = %q, want stream_interrupted error", last)
 	}

@@ -1,5 +1,4 @@
-// Package api holds the OpenAI-compatible wire types Tollgate exposes to clients.
-package api
+package gateway
 
 // ChatMessage is one message in a chat completion request or response.
 type ChatMessage struct {
@@ -8,7 +7,7 @@ type ChatMessage struct {
 }
 
 // ChatCompletionRequest is the subset of the OpenAI chat completions request
-// that Tollgate understands. Unknown fields are ignored.
+// that the gateway understands. Unknown fields are ignored.
 type ChatCompletionRequest struct {
 	Model       string        `json:"model"`
 	Messages    []ChatMessage `json:"messages"`
@@ -73,7 +72,7 @@ type Usage struct {
 }
 
 // ErrorResponse mirrors the OpenAI error envelope so existing SDKs surface
-// Tollgate errors cleanly.
+// gateway errors cleanly.
 type ErrorResponse struct {
 	Error ErrorBody `json:"error"`
 }

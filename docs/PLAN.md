@@ -36,10 +36,10 @@ exactly-once tools, approvals and an audit trail built in.
 
 ## Package boundaries
 
-The dependency graph today:
+The dependency graph (enforced by `internal/archtest`):
 
 ```
-leaves (depend on nothing internal): breaker, mcp, metrics, provider, ratelimit, telemetry
+leaves (depend on nothing internal): breaker, config, mcp, metrics, provider, ratelimit, telemetry
 core      → provider            (chat types: Message, ToolCall, Response)
 store     → core                memory, postgres → store, core
 tools     → core, mcp, telemetry
@@ -62,11 +62,11 @@ Target rules:
 
 ## Phase 1: Clean boundaries and independent services
 
-- [ ] Move the OpenAI wire types from `api/types.go` into `gateway` (gateway → provider only)
-- [ ] `config` keeps `STEPWISE_RATE_LIMITS` as a string; `cmd/stepwise` parses it with `ratelimit.ParseRules`
-- [ ] Dependency-rules test (`internal/archtest`) encoding the rules above
-- [ ] `stepwise webhooks` role, so the dispatcher can run on its own like `api` and `worker`
-- [ ] Docker Compose runs api, worker and webhooks as separate services
+- [x] Move the OpenAI wire types from `api/types.go` into `gateway` (gateway → provider only)
+- [x] `config` keeps `STEPWISE_RATE_LIMITS` as a string; `cmd/stepwise` parses it with `ratelimit.ParseRules`
+- [x] Dependency-rules test (`internal/archtest`) encoding the rules above
+- [x] `stepwise webhooks` role, so the dispatcher can run on its own like `api` and `worker`
+- [x] Docker Compose runs api, worker and webhooks as separate services
 
 **Done when:** the dependency test passes, and each of api, worker and webhooks can be started,
 stopped and scaled alone without affecting the others' work.

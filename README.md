@@ -148,7 +148,7 @@ go run ./cmd/stepwise worker           # in another terminal: more workers, same
 | --- | --- |
 | `stepwise dev` | API, UI, workers, webhooks and the demo shop in one process, in memory |
 | `stepwise serve` | API + workers + webhooks against Postgres (`STEPWISE_DATABASE_URL`) |
-| `stepwise api` / `stepwise worker` | Split roles; scale workers horizontally |
+| `stepwise api` / `worker` / `webhooks` | Run each service separately; they share only Postgres. Scale any of them horizontally |
 | `stepwise migrate` | Apply database migrations |
 | `stepwise demo-shop` | The demo shop MCP server on its own |
 | `stepwise healthcheck` | Exit 0 if the local server is healthy (for containers without curl) |

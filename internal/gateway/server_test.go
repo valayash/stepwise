@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/valayash/stepwise/internal/api"
 	"github.com/valayash/stepwise/internal/provider"
 )
 
@@ -87,7 +86,7 @@ func TestChatCompletionsHappyPath(t *testing.T) {
 		t.Error("missing X-Request-ID header")
 	}
 
-	var res api.ChatCompletionResponse
+	var res ChatCompletionResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +136,7 @@ func TestChatCompletionsErrors(t *testing.T) {
 			if rec.Code != tc.wantCode {
 				t.Fatalf("status = %d, want %d (body %s)", rec.Code, tc.wantCode, rec.Body)
 			}
-			var er api.ErrorResponse
+			var er ErrorResponse
 			if err := json.Unmarshal(rec.Body.Bytes(), &er); err != nil {
 				t.Fatalf("error body not JSON: %s", rec.Body)
 			}
