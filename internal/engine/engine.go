@@ -51,29 +51,20 @@ func (c *Config) defaults() {
 		host, _ := os.Hostname()
 		c.WorkerID = fmt.Sprintf("%s-%d-%04x", host, os.Getpid(), rand.IntN(1<<16))
 	}
-	if c.Workers <= 0 {
-		c.Workers = 8
-	}
-	if c.Lease <= 0 {
-		c.Lease = 30 * time.Second
-	}
-	if c.PollInterval <= 0 {
-		c.PollInterval = time.Second
-	}
-	if c.LLMTimeout <= 0 {
-		c.LLMTimeout = 2 * time.Minute
-	}
-	if c.MaxAttempts <= 0 {
-		c.MaxAttempts = 6
-	}
-	if c.BackoffBase <= 0 {
-		c.BackoffBase = time.Second
-	}
-	if c.BackoffMax <= 0 {
-		c.BackoffMax = 2 * time.Minute
-	}
-	if c.StepsPerClaim <= 0 {
-		c.StepsPerClaim = 100
+	orDefault(&c.Workers, 8)
+	orDefault(&c.Lease, 30*time.Second)
+	orDefault(&c.PollInterval, time.Second)
+	orDefault(&c.LLMTimeout, 2*time.Minute)
+	orDefault(&c.MaxAttempts, 6)
+	orDefault(&c.BackoffBase, time.Second)
+	orDefault(&c.BackoffMax, 2*time.Minute)
+	orDefault(&c.StepsPerClaim, 100)
+}
+
+// orDefault sets *v to def when it is unset (zero or negative).
+func orDefault[T int | time.Duration](v *T, def T) {
+	if *v <= 0 {
+		*v = def
 	}
 }
 
@@ -342,26 +333,10 @@ func (x *execution) callLLM(ctx context.Context, seq int) error {
 	msgs := conversation(x.run, x.steps)
 	toolDefs := spec.ToolDefs()
 
-	// Circuit breaker first (cheap, local), then the shared rate limiter.
 	br := x.e.breakers.Get(p.Name())
-	if ok, wait := br.Allow(); !ok {
-		x.e.m.breakerRejected.Inc(p.Name())
-		trace.SpanFromContext(ctx).AddEvent("circuit_open", trace.WithAttributes(attribute.String("gen_ai.system", p.Name())))
-		return x.yield(ctx, store.Yield{Status: core.RunQueued, AvailableAt: x.e.now().Add(wait), Attempts: x.run.Attempts, Error: p.Name() + " circuit open"})
-	}
-	estimate := ratelimit.EstimateTokens(promptChars(msgs, toolDefs), maxTokens)
-	wait, err := x.e.limiter.Reserve(ctx, model, estimate)
+	estimate, err := x.admit(ctx, br, p.Name(), model, ratelimit.EstimateTokens(promptChars(msgs, toolDefs), maxTokens))
 	if err != nil {
-		// Fail open: a limiter outage should not stop every agent. Providers
-		// still enforce their own limits, which we handle as retries.
-		x.log.Warn("rate limiter unavailable; proceeding", "err", err)
-		estimate = 0
-	} else if wait > 0 {
-		br.Abort()
-		x.e.m.rateLimited.Inc(model)
-		trace.SpanFromContext(ctx).AddEvent("rate_limited", trace.WithAttributes(
-			attribute.String("gen_ai.request.model", model), attribute.Int64("stepwise.wait_ms", wait.Milliseconds())))
-		return x.yield(ctx, store.Yield{Status: core.RunQueued, AvailableAt: x.e.now().Add(wait), Attempts: x.run.Attempts})
+		return err
 	}
 
 	step, err := x.e.store.BeginStep(ctx, x.f, core.Step{Seq: seq, Kind: core.StepLLM})
@@ -390,19 +365,13 @@ func (x *execution) callLLM(ctx context.Context, seq int) error {
 	cancel()
 	elapsed := x.e.now().Sub(start)
 	x.e.m.llmSeconds.Observe(elapsed.Seconds(), p.Name())
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-	} else {
-		span.SetAttributes(
-			attribute.String("gen_ai.response.id", resp.ID),
-			attribute.StringSlice("gen_ai.response.finish_reasons", []string{resp.FinishReason}),
-			attribute.Int("gen_ai.usage.input_tokens", resp.InputTokens),
-			attribute.Int("gen_ai.usage.output_tokens", resp.OutputTokens),
-			attribute.Int("stepwise.tool_calls", len(resp.ToolCalls)),
-		)
-	}
-	span.End()
+	endSpan(span, err,
+		attribute.String("gen_ai.response.id", resp.ID),
+		attribute.StringSlice("gen_ai.response.finish_reasons", []string{resp.FinishReason}),
+		attribute.Int("gen_ai.usage.input_tokens", resp.InputTokens),
+		attribute.Int("gen_ai.usage.output_tokens", resp.OutputTokens),
+		attribute.Int("stepwise.tool_calls", len(resp.ToolCalls)),
+	)
 
 	if err != nil {
 		_ = x.e.limiter.Settle(context.WithoutCancel(ctx), model, -estimate)
@@ -437,6 +406,33 @@ func (x *execution) callLLM(ctx context.Context, seq int) error {
 	x.run.Attempts = 0
 	x.e.m.steps.Inc(string(core.StepLLM))
 	return nil
+}
+
+// admit asks the circuit breaker (cheap, local), then the shared rate
+// limiter, for permission to call the model. If either says "not now", the
+// run goes back to the queue and admit returns errStop. It returns the token
+// estimate actually reserved, which the caller settles after the call.
+func (x *execution) admit(ctx context.Context, br *breaker.Breaker, system, model string, estimate int) (int, error) {
+	if ok, wait := br.Allow(); !ok {
+		x.e.m.breakerRejected.Inc(system)
+		trace.SpanFromContext(ctx).AddEvent("circuit_open", trace.WithAttributes(attribute.String("gen_ai.system", system)))
+		return 0, x.yield(ctx, store.Yield{Status: core.RunQueued, AvailableAt: x.e.now().Add(wait), Attempts: x.run.Attempts, Error: system + " circuit open"})
+	}
+	wait, err := x.e.limiter.Reserve(ctx, model, estimate)
+	if err != nil {
+		// Fail open: a limiter outage should not stop every agent. Providers
+		// still enforce their own limits, which we handle as retries.
+		x.log.Warn("rate limiter unavailable; proceeding", "err", err)
+		return 0, nil
+	}
+	if wait > 0 {
+		br.Abort()
+		x.e.m.rateLimited.Inc(model)
+		trace.SpanFromContext(ctx).AddEvent("rate_limited", trace.WithAttributes(
+			attribute.String("gen_ai.request.model", model), attribute.Int64("stepwise.wait_ms", wait.Milliseconds())))
+		return 0, x.yield(ctx, store.Yield{Status: core.RunQueued, AvailableAt: x.e.now().Add(wait), Attempts: x.run.Attempts})
+	}
+	return estimate, nil
 }
 
 // retryLater hands the run back with exponential backoff, or fails it once
@@ -533,13 +529,7 @@ func (x *execution) runTool(ctx context.Context, st core.Step, spec core.ToolSpe
 	})
 	elapsed := x.e.now().Sub(start)
 	x.e.m.toolSeconds.Observe(elapsed.Seconds(), string(spec.Type))
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-	} else {
-		span.SetAttributes(attribute.Bool("stepwise.tool.is_error", res.IsError))
-	}
-	span.End()
+	endSpan(span, err, attribute.Bool("stepwise.tool.is_error", res.IsError))
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -617,6 +607,17 @@ func (x *execution) finish(ctx context.Context, o store.Outcome) error {
 }
 
 // ---- helpers ----
+
+// endSpan records err on span, or the success attributes when there is none.
+func endSpan(span trace.Span, err error, ok ...attribute.KeyValue) {
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	} else {
+		span.SetAttributes(ok...)
+	}
+	span.End()
+}
 
 func promptChars(msgs []provider.Message, defs []provider.ToolDef) int {
 	n := 0
