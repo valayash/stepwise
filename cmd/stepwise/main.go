@@ -213,7 +213,8 @@ func run(ctx context.Context, log *slog.Logger, cfg config.Config, r roles) erro
 			mux.Handle("/", (&api.Server{
 				Store: st, Tools: runner, Router: router, Token: cfg.APIToken,
 				Metrics: reg.Handler(), Gateway: gw.Handler(), Log: log, MaxBodyBytes: cfg.MaxBodyBytes,
-				Info: api.Info{Version: version, Mode: modeName(r), Models: router.Models(), DemoShopURL: shopURL},
+				MonthlyTokenLimit: cfg.MonthlyTokenLimit,
+				Info:              api.Info{Version: version, Mode: modeName(r), Models: router.Models(), DemoShopURL: shopURL},
 			}).Handler())
 		}
 		srv := &http.Server{Addr: cfg.Addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}

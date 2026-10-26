@@ -38,6 +38,8 @@ type Server struct {
 	MaxBodyBytes int64
 	// Info is served at GET /v1/info.
 	Info Info
+	// MonthlyTokenLimit, if set, refuses new runs once this month's usage reaches it.
+	MonthlyTokenLimit int
 }
 
 // Info describes this deployment to clients and the UI.
@@ -75,6 +77,7 @@ func (s *Server) Handler() http.Handler {
 	v1.HandleFunc("POST /v1/runs/{id}/steps/{step}/approve", s.serveJSON(s.decide(true)))
 	v1.HandleFunc("POST /v1/runs/{id}/steps/{step}/reject", s.serveJSON(s.decide(false)))
 	v1.HandleFunc("GET /v1/approvals", s.serveJSON(s.approvals))
+	v1.HandleFunc("GET /v1/usage", s.serveJSON(s.usage))
 	v1.HandleFunc("GET /v1/info", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, s.Info) })
 	if s.Gateway != nil {
 		v1.Handle("POST /v1/chat/completions", s.Gateway)
@@ -113,6 +116,10 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
+	if err := s.checkSpend(ctx); err != nil {
+		writeErr(w, err)
+		return
+	}
 	spec, err := s.Tools.Prepare(ctx, *req.Agent)
 	if err != nil {
 		writeErr(w, err)
@@ -173,6 +180,36 @@ func (s *Server) serveJSON(fn handlerFunc) http.HandlerFunc {
 			writeJSON(w, 200, v)
 		}
 	}
+}
+
+type usageView struct {
+	store.Usage
+	Since time.Time `json:"since"`
+	Limit int       `json:"monthly_token_limit,omitempty"`
+}
+
+// monthUsage is this calendar month's spend (UTC).
+func (s *Server) monthUsage(ctx context.Context) (usageView, error) {
+	now := time.Now().UTC()
+	v := usageView{Since: time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC), Limit: s.MonthlyTokenLimit}
+	var err error
+	v.Usage, err = s.Store.Usage(ctx, v.Since)
+	return v, err
+}
+
+func (s *Server) usage(_ http.ResponseWriter, r *http.Request) (any, error) {
+	return s.monthUsage(r.Context())
+}
+
+func (s *Server) checkSpend(ctx context.Context) error {
+	if s.MonthlyTokenLimit <= 0 {
+		return nil
+	}
+	u, err := s.monthUsage(ctx)
+	if err == nil && u.Tokens >= u.Limit {
+		err = fmt.Errorf("%w: monthly token limit of %d reached (%d used)", core.ErrLimit, u.Limit, u.Tokens)
+	}
+	return err
 }
 
 func (s *Server) listRuns(_ http.ResponseWriter, r *http.Request) (any, error) {
@@ -448,6 +485,8 @@ func writeErr(w http.ResponseWriter, err error) {
 		writeJSON(w, 400, errorBody("invalid_request", err.Error()))
 	case errors.Is(err, core.ErrNotRunnable), errors.Is(err, core.ErrConflict):
 		writeJSON(w, 409, errorBody("conflict", err.Error()))
+	case errors.Is(err, core.ErrLimit):
+		writeJSON(w, http.StatusTooManyRequests, errorBody("limit_reached", err.Error()))
 	default:
 		writeJSON(w, 500, errorBody("internal", "internal error"))
 	}

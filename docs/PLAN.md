@@ -70,21 +70,27 @@ Target rules:
 **Done when:** the dependency test passes, and each of api, worker and webhooks can be started,
 stopped and scaled alone without affecting the others' work.
 
-## Phase 2: Core features
+## Phase 2: Core features, guardrails and cost
 
-Core means: agents run reliably and safely, and results are usable. No new tables or columns.
+Core means: agents run reliably, safely and cheaply, and results are usable. No new tables or columns.
 
-- [ ] **Spend limit.** Optional `STEPWISE_MONTHLY_TOKEN_LIMIT`: new runs are rejected once this
-      month's token usage passes it, so a looping agent can't run up our model bill. One query
-      over `runs.tokens_used`, also exposed as `GET /v1/usage`.
+- [x] **Spend limit.** Optional `STEPWISE_MONTHLY_TOKEN_LIMIT`: new runs are rejected once this
+      month's token usage passes it. Usage also exposed as `GET /v1/usage`.
+- [ ] **Prompt caching.** Anthropic `cache_control` on the system prompt, tools and latest
+      message, so each turn doesn't pay full price for the conversation again.
+- [ ] **Per-tool call limits.** `"limits": {"issue_refund": 1}` on the agent; extra calls are
+      returned to the model as errors, like unknown tools.
+- [ ] **Tool host allowlist.** Optional `STEPWISE_ALLOWED_TOOL_HOSTS`: tools may only call
+      these hosts, so a spec can't reach internal addresses.
+- [ ] **Approval expiry.** `"approval_timeout": "24h"` on the agent: unanswered approvals are
+      auto-rejected and the model is told why.
 - [ ] **Structured output.** An optional `response_schema` on the agent makes the final answer
-      JSON matching the schema, stored in the existing `output` column. Reuses the tool-calling
-      path: the final answer becomes a forced "respond" tool.
-- [ ] **Retention.** Optional `STEPWISE_RETENTION_DAYS`: finished runs (with their steps and
-      deliveries) older than that are deleted on a schedule, so the database stays bounded.
+      JSON matching the schema, stored in the existing `output` column.
+- [ ] **Retention.** Optional `STEPWISE_RETENTION_DAYS`: finished runs older than that are deleted.
 
-**Done when:** spending stops at the limit, a program gets valid JSON back from a run, and old
-runs are cleaned up automatically.
+**Done when:** spending stops at the limit, repeated turns hit the prompt cache, a run can't
+refund twice or call internal hosts, no approval waits forever, programs get valid JSON, and
+old runs are cleaned up.
 
 ## Phase 3: Launch
 

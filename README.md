@@ -164,6 +164,7 @@ go run ./cmd/stepwise worker           # in another terminal: more workers, same
 | `POST` | `/v1/runs/{id}/steps/{step}/approve` · `/reject` | Decide a pending tool call (`note`, `decided_by`) |
 | `POST` | `/v1/runs/{id}/cancel` · `/retry` | Cancel (cascades to sub-agents) · retry a failed run |
 | `GET` | `/v1/approvals` | Inbox of every tool call waiting for a human |
+| `GET` | `/v1/usage` | This month's runs and tokens, and the monthly limit |
 | `GET` | `/v1/runs/{id}/deliveries` | Webhook delivery log |
 | `POST` | `/v1/chat/completions` | OpenAI-compatible passthrough |
 | `GET` | `/metrics` · `/healthz` · `/readyz` | Operations |
@@ -184,6 +185,7 @@ go run ./cmd/stepwise worker           # in another terminal: more workers, same
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | Send traces, e.g. `http://jaeger:4318` |
 | `STEPWISE_METRICS_ADDR` | — | Metrics + health port for worker-only processes |
 | `STEPWISE_DEMO_SHOP_URL` | — | Shop URL the UI's example uses (reachable by workers) |
+| `STEPWISE_MONTHLY_TOKEN_LIMIT` | — | Refuse new runs (HTTP 429) once this month's tokens reach it; see `GET /v1/usage` |
 | `STEPWISE_WEBHOOK_SECRET` | — | HMAC key for webhook signatures |
 | `STEPWISE_SECRET_*` | — | Secrets tool `headers` may reference, e.g. `"Authorization": "Bearer ${STEPWISE_SECRET_SHOP}"`; resolved per call, only sent to the tool's own host, never stored |
 | `STEPWISE_TRIAGE` · `_MODEL` · `_AUTO_RETRY` | `true` · auto · `false` | Self-healing triage agent |

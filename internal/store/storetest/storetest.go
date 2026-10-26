@@ -197,6 +197,12 @@ func testCompleteCountsTokens(t *testing.T, s store.Store) {
 	if got.TokensUsed != 42 {
 		t.Errorf("tokens double-counted: %d", got.TokensUsed)
 	}
+	if u, err := s.Usage(ctx, got.CreatedAt); err != nil || u.Runs != 1 || u.Tokens != 42 {
+		t.Errorf("usage = %+v %v", u, err)
+	}
+	if u, _ := s.Usage(ctx, got.CreatedAt.Add(time.Hour)); u.Runs != 0 {
+		t.Errorf("usage after the run = %+v", u)
+	}
 }
 
 func testYieldDelay(t *testing.T, s store.Store) {

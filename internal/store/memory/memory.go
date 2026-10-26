@@ -112,6 +112,20 @@ func (m *Store) GetRun(_ context.Context, id string) (core.Run, error) {
 	return clone(r), nil
 }
 
+// Usage implements store.Store.
+func (m *Store) Usage(_ context.Context, since time.Time) (store.Usage, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var u store.Usage
+	for _, r := range m.runs {
+		if r.ParentRunID == "" && !r.CreatedAt.Before(since) {
+			u.Runs++
+			u.Tokens += r.TokensUsed
+		}
+	}
+	return u, nil
+}
+
 // ListRuns implements store.Store. Newest first.
 func (m *Store) ListRuns(_ context.Context, f store.ListFilter) ([]core.Run, error) {
 	m.mu.Lock()

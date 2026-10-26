@@ -29,7 +29,7 @@ type env struct {
 	store *memory.Store
 }
 
-func setup(t *testing.T, token string) *env {
+func setup(t *testing.T, token string, opts ...func(*Server)) *env {
 	t.Helper()
 	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
 	shop := httptest.NewServer(demo.NewShop(time.Now()).Handler())
@@ -46,7 +46,11 @@ func setup(t *testing.T, token string) *env {
 	go func() { eng.Run(ctx); close(done) }()
 	t.Cleanup(func() { cancel(); <-done })
 
-	srv := httptest.NewServer((&Server{Store: st, Tools: runner, Router: router, Token: token, Log: quiet}).Handler())
+	s := &Server{Store: st, Tools: runner, Router: router, Token: token, Log: quiet}
+	for _, o := range opts {
+		o(s)
+	}
+	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 	return &env{t: t, url: srv.URL, shop: shop.URL + "/mcp", token: token, store: st}
 }
@@ -151,6 +155,20 @@ func TestCreateValidation(t *testing.T) {
 	}
 	if code, _ := e.do("GET", "/v1/runs/nope", ""); code != 404 {
 		t.Errorf("missing run = %d", code)
+	}
+}
+
+func TestMonthlyTokenLimit(t *testing.T) {
+	e := setup(t, "", func(s *Server) { s.MonthlyTokenLimit = 1 })
+	body := `{"agent":{"model":"mock"},"input":"hi"}`
+	_, run := e.do("POST", "/v1/runs", body)
+	e.waitStatus(run["id"].(string), "completed")
+	if code, out := e.do("POST", "/v1/runs", body); code != 429 {
+		t.Errorf("over the limit: %d %v", code, out)
+	}
+	_, u := e.do("GET", "/v1/usage", "")
+	if u["runs"] != 1.0 || u["tokens"].(float64) < 1 || u["monthly_token_limit"] != 1.0 {
+		t.Errorf("usage = %v", u)
 	}
 }
 

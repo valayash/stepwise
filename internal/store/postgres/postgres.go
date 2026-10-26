@@ -450,6 +450,14 @@ func (s *Store) ListRuns(ctx context.Context, f store.ListFilter) ([]core.Run, e
 	return scanAll(rows, err, scanRun)
 }
 
+// Usage implements store.Store.
+func (s *Store) Usage(ctx context.Context, since time.Time) (store.Usage, error) {
+	var u store.Usage
+	err := s.db.QueryRowContext(ctx, `SELECT count(*), COALESCE(sum(tokens_used), 0) FROM runs
+		WHERE parent_run_id IS NULL AND created_at >= $1`, since).Scan(&u.Runs, &u.Tokens)
+	return u, err
+}
+
 // ListSteps implements store.Store.
 func (s *Store) ListSteps(ctx context.Context, runID string) ([]core.Step, error) {
 	var exists bool

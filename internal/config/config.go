@@ -10,13 +10,14 @@ import (
 
 // Config is the runtime configuration. Every field maps to one variable.
 type Config struct {
-	Addr         string // STEPWISE_ADDR, default ":8080"
-	DatabaseURL  string // STEPWISE_DATABASE_URL; empty = in-memory store (dev only)
-	RedisURL     string // STEPWISE_REDIS_URL; shares rate limits across all workers
-	MetricsAddr  string // STEPWISE_METRICS_ADDR; metrics + health for worker-only processes
-	DemoShopURL  string // STEPWISE_DEMO_SHOP_URL; MCP URL the UI's example run uses
-	APIToken     string // STEPWISE_API_TOKEN; empty = no auth
-	MaxBodyBytes int64  // STEPWISE_MAX_BODY_BYTES, default 1 MiB
+	Addr              string // STEPWISE_ADDR, default ":8080"
+	DatabaseURL       string // STEPWISE_DATABASE_URL; empty = in-memory store (dev only)
+	RedisURL          string // STEPWISE_REDIS_URL; shares rate limits across all workers
+	MetricsAddr       string // STEPWISE_METRICS_ADDR; metrics + health for worker-only processes
+	DemoShopURL       string // STEPWISE_DEMO_SHOP_URL; MCP URL the UI's example run uses
+	APIToken          string // STEPWISE_API_TOKEN; empty = no auth
+	MaxBodyBytes      int64  // STEPWISE_MAX_BODY_BYTES, default 1 MiB
+	MonthlyTokenLimit int    // STEPWISE_MONTHLY_TOKEN_LIMIT; refuse new runs once this month's usage reaches it
 
 	// Providers.
 	AnthropicAPIKey string        // ANTHROPIC_API_KEY; enables claude-* models
@@ -100,6 +101,7 @@ func Load() (Config, error) {
 	}{
 		{"STEPWISE_WORKERS", &c.Workers},
 		{"STEPWISE_MAX_ATTEMPTS", &c.MaxAttempts},
+		{"STEPWISE_MONTHLY_TOKEN_LIMIT", &c.MonthlyTokenLimit},
 	}
 	for _, i := range ints {
 		if v := os.Getenv(i.env); v != "" {

@@ -286,6 +286,7 @@ var (
 	ErrConflict    = errors.New("conflict")
 	ErrInvalid     = errors.New("invalid request")
 	ErrNotRunnable = errors.New("run is not in a state that allows this")
+	ErrLimit       = errors.New("limit reached")
 )
 
 // NewID returns a random 128-bit hex ID.

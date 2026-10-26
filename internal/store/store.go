@@ -27,6 +27,9 @@ type Store interface {
 	GetRun(ctx context.Context, id string) (core.Run, error)
 	ListRuns(ctx context.Context, f ListFilter) ([]core.Run, error)
 	ListSteps(ctx context.Context, runID string) ([]core.Step, error)
+	// Usage totals top-level runs created since a time (sub-agent tokens
+	// already roll up into their parents).
+	Usage(ctx context.Context, since time.Time) (Usage, error)
 
 	// ---- workers ----
 
@@ -75,6 +78,12 @@ type Store interface {
 	Subscribe() (<-chan Event, func())
 
 	Close() error
+}
+
+// Usage is token spend over a period.
+type Usage struct {
+	Runs   int `json:"runs"`
+	Tokens int `json:"tokens"`
 }
 
 // ListFilter narrows ListRuns.
