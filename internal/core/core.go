@@ -91,7 +91,11 @@ type ToolSpec struct {
 	URL         string          `json:"url,omitempty"`
 	Include     []string        `json:"include,omitempty"` // MCP server reference filter
 	Agent       *AgentSpec      `json:"agent,omitempty"`   // sub-agent definition
-	TimeoutSecs int             `json:"timeout_seconds,omitempty"`
+	// Headers are sent with every HTTP or MCP request for this tool. Values may
+	// reference ${STEPWISE_SECRET_*} variables, resolved at call time so secrets
+	// are never stored with the run.
+	Headers     map[string]string `json:"headers,omitempty"`
+	TimeoutSecs int               `json:"timeout_seconds,omitempty"`
 }
 
 // AgentSpec defines an agent: model, instructions, tools and limits.

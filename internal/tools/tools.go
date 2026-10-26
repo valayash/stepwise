@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -61,7 +63,7 @@ type Runner struct {
 
 // NewRunner returns a runner with default clients.
 func NewRunner() *Runner {
-	hc := &http.Client{}
+	hc := &http.Client{Transport: headerTransport{http.DefaultTransport}}
 	return &Runner{HTTP: hc, MCP: mcp.NewClient(hc), Builtins: map[string]Builtin{}}
 }
 
@@ -74,11 +76,12 @@ func (r *Runner) Run(ctx context.Context, c Call) (Result, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	ctx, err := withHeaders(ctx, c.Spec)
+	if err != nil {
+		return Result{Text: err.Error(), IsError: true}, nil
+	}
 
-	var (
-		res Result
-		err error
-	)
+	var res Result
 	switch c.Spec.Type {
 	case core.ToolHTTP:
 		res, err = r.runHTTP(ctx, c)
@@ -172,6 +175,10 @@ func (r *Runner) prepare(ctx context.Context, spec core.AgentSpec, depth int) (c
 	}
 	var out []core.ToolSpec
 	for i, t := range spec.Tools {
+		tctx, err := withHeaders(ctx, t)
+		if err != nil {
+			return spec, fmt.Errorf("tools[%d]: %w", i, err)
+		}
 		switch t.Type {
 		case core.ToolMCP:
 			if t.URL == "" {
@@ -181,7 +188,7 @@ func (r *Runner) prepare(ctx context.Context, spec core.AgentSpec, depth int) (c
 				out = append(out, t) // already concrete
 				continue
 			}
-			listed, err := r.MCP.ListTools(ctx, t.URL)
+			listed, err := r.MCP.ListTools(tctx, t.URL)
 			if err != nil {
 				return spec, fmt.Errorf("%w: tools[%d]: listing tools from %s: %v", core.ErrInvalid, i, t.URL, err)
 			}
@@ -196,10 +203,9 @@ func (r *Runner) prepare(ctx context.Context, spec core.AgentSpec, depth int) (c
 				if len(keep) > 0 && !keep[lt.Name] {
 					continue
 				}
-				out = append(out, core.ToolSpec{
-					Type: core.ToolMCP, Name: lt.Name, Description: lt.Description,
-					InputSchema: lt.InputSchema, URL: t.URL, TimeoutSecs: t.TimeoutSecs,
-				})
+				nt := t
+				nt.Name, nt.Description, nt.InputSchema, nt.Include = lt.Name, lt.Description, lt.InputSchema, nil
+				out = append(out, nt)
 			}
 		case core.ToolHTTP:
 			if t.URL == "" {
@@ -253,4 +259,61 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// SecretPrefix limits which environment variables tool headers may read, so
+// an agent spec can never send the server's own keys to a tool.
+const SecretPrefix = "STEPWISE_SECRET_"
+
+type toolHeaders struct {
+	host string
+	h    map[string]string
+}
+
+type headersKey struct{}
+
+// withHeaders resolves a tool's headers and attaches them to ctx, where
+// headerTransport picks them up for both HTTP and MCP requests.
+func withHeaders(ctx context.Context, t core.ToolSpec) (context.Context, error) {
+	if len(t.Headers) == 0 {
+		return ctx, nil
+	}
+	u, err := url.Parse(t.URL)
+	if err != nil {
+		return ctx, fmt.Errorf("%w: bad url: %v", core.ErrInvalid, err)
+	}
+	h := make(map[string]string, len(t.Headers))
+	for k, v := range t.Headers {
+		var bad string
+		h[k] = os.Expand(v, func(name string) string {
+			val, ok := os.LookupEnv(name)
+			if !ok || !strings.HasPrefix(name, SecretPrefix) {
+				bad = name
+				return ""
+			}
+			return val
+		})
+		if bad != "" {
+			return ctx, fmt.Errorf("%w: header %s references ${%s}; only set %s* variables are allowed", core.ErrInvalid, k, bad, SecretPrefix)
+		}
+	}
+	return context.WithValue(ctx, headersKey{}, toolHeaders{host: u.Host, h: h}), nil
+}
+
+// headerTransport adds a tool's headers to requests for the tool's own host
+// only (never to a redirect target), without overriding Stepwise's headers.
+type headerTransport struct{ next http.RoundTripper }
+
+func (t headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	th, ok := req.Context().Value(headersKey{}).(toolHeaders)
+	if !ok || req.URL.Host != th.host {
+		return t.next.RoundTrip(req)
+	}
+	req = req.Clone(req.Context())
+	for k, v := range th.h {
+		if req.Header.Get(k) == "" {
+			req.Header.Set(k, v)
+		}
+	}
+	return t.next.RoundTrip(req)
 }
