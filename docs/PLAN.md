@@ -93,6 +93,27 @@ Core means: agents run reliably, safely and cheaply, and results are usable. No 
 refund twice or call internal hosts, no approval waits forever, programs get valid JSON, and
 old runs are cleaned up.
 
+## Phase 2b: Performance (from the code review)
+
+Ranked by impact for the code it costs. Numbers come from the review's own Postgres
+measurements and should be re-checked when each item is built.
+
+- [ ] **Claim query.** Split `ClaimRuns` into two `LIMIT … SKIP LOCKED` branches, each on its
+      partial index, then `UNION ALL`. Measured: 13.7 ms → 0.2 ms per claim with 2,000 queued,
+      ~7x claims/s.
+- [ ] **Webhook dispatcher wake-ups.** Stop claiming deliveries on every `run_changed` event;
+      poll, or wake only on a deliveries event.
+- [ ] **Live view (SSE) queries.** Drop `isChild` (a `GetRun` per fleet event per viewer;
+      parents are already notified) and don't resend unchanged snapshots for runs with children.
+- [ ] **NOTIFY volume.** `pg_notify` serializes commits (measured −69% tps at 32 clients).
+      Stop notifying `run_changed` from BeginStep and SaveStep, and batch the rest.
+- [ ] **Deferred yields.** Don't send `runs_ready` for runs requeued into the future.
+- [x] **Approvals inbox N+1.** Fixed with `PendingApprovals` (one query).
+- [ ] **Connection pool.** Idle connections = open connections.
+- [ ] **Fewer writes per step.** `fillfactor` on `runs`, drop the redundant `touch`, lighter
+      `lockFenced`.
+- [ ] **Triage storms.** Skip the LLM triage call when the rules already classify a failure as transient.
+
 ## Phase 3: Launch
 
 - [ ] Deploy: one managed host with Postgres (daily backups), TLS and a domain; the API token is set
