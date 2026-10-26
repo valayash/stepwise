@@ -89,6 +89,17 @@ type anthropicRequest struct {
 	// the end of the conversation each turn, so an agent loop re-reads its
 	// growing history from cache instead of paying full price again.
 	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
+	OutputConfig *anthropicOutputConfig `json:"output_config,omitempty"`
+}
+
+// anthropicOutputConfig carries structured output: {"format": {"type": "json_schema", "schema": ...}}.
+type anthropicOutputConfig struct {
+	Format jsonSchemaFormat `json:"format"`
+}
+
+type jsonSchemaFormat struct {
+	Type   string          `json:"type"`
+	Schema json.RawMessage `json:"schema"`
 }
 
 type anthropicCacheControl struct {
@@ -265,6 +276,9 @@ func (a *Anthropic) send(ctx context.Context, req Request, stream bool) (*http.R
 		Temperature:  req.Temperature,
 		Stream:       stream,
 		CacheControl: &anthropicCacheControl{Type: "ephemeral"},
+	}
+	if len(req.ResponseSchema) > 0 {
+		body.OutputConfig = &anthropicOutputConfig{Format: jsonSchemaFormat{Type: "json_schema", Schema: req.ResponseSchema}}
 	}
 	if body.MaxTokens <= 0 {
 		body.MaxTokens = anthropicDefaultMax

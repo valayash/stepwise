@@ -70,13 +70,17 @@ func (m *Mock) Complete(ctx context.Context, req Request) (Response, error) {
 	}
 	id := fmt.Sprintf("mock-%d", m.seq.Add(1))
 
+	text := "mock: " + lastUser
 	if len(req.Tools) > 0 {
 		if res, ok := m.nextToolCall(id, req, firstUser, in); ok {
 			return res, nil
 		}
-		return m.answer(id, "mock: done. "+summarizeToolResults(req.Messages), in, req.MaxTokens), nil
+		text = "mock: done. " + summarizeToolResults(req.Messages)
 	}
-	return m.answer(id, "mock: "+lastUser, in, req.MaxTokens), nil
+	if len(req.ResponseSchema) > 0 {
+		text = string(fillArgs(req.ResponseSchema, firstUser)) // JSON built from "key: value" pairs, like tool args
+	}
+	return m.answer(id, text, in, req.MaxTokens), nil
 }
 
 // nextToolCall returns a call for the first offered tool not yet called.

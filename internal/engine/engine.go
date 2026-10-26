@@ -350,6 +350,10 @@ func (x *execution) do(ctx context.Context, a action) error {
 	case actExecTool:
 		return x.execTool(ctx, *a.step)
 	case actComplete:
+		if len(x.run.Spec.ResponseSchema) > 0 && !json.Valid([]byte(a.output)) {
+			// A refusal or a max_tokens cut can still break the schema; callers rely on JSON.
+			return x.finish(ctx, store.Outcome{Status: core.RunFailed, FailureKind: core.FailFatal, Error: "final answer is not valid JSON for response_schema"})
+		}
 		return x.finish(ctx, store.Outcome{Status: core.RunCompleted, Output: a.output})
 	case actFail:
 		return x.finish(ctx, store.Outcome{Status: core.RunFailed, Error: a.reason, FailureKind: a.fail})
@@ -401,6 +405,7 @@ func (x *execution) callLLM(ctx context.Context, seq int) error {
 	start := x.e.now()
 	resp, err := p.Complete(callCtx, provider.Request{
 		Model: model, Messages: msgs, Tools: toolDefs, MaxTokens: maxTokens, Temperature: spec.Temperature,
+		ResponseSchema: spec.ResponseSchema,
 	})
 	cancel()
 	elapsed := x.e.now().Sub(start)

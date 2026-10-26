@@ -73,6 +73,19 @@ type openAIRequest struct {
 	StreamOptions *struct {
 		IncludeUsage bool `json:"include_usage"`
 	} `json:"stream_options,omitempty"`
+	ResponseFormat *openAIResponseFormat `json:"response_format,omitempty"`
+}
+
+// openAIResponseFormat carries structured output: {"type": "json_schema", "json_schema": {...}}.
+type openAIResponseFormat struct {
+	Type       string           `json:"type"`
+	JSONSchema openAIJSONSchema `json:"json_schema"`
+}
+
+type openAIJSONSchema struct {
+	Name   string          `json:"name"`
+	Schema json.RawMessage `json:"schema"`
+	Strict bool            `json:"strict"`
 }
 
 type openAIUsage struct {
@@ -123,6 +136,10 @@ func (o *OpenAI) buildBody(req Request, stream bool) openAIRequest {
 		MaxTokens:   req.MaxTokens,
 		Temperature: req.Temperature,
 		Stream:      stream,
+	}
+	if len(req.ResponseSchema) > 0 {
+		body.ResponseFormat = &openAIResponseFormat{Type: "json_schema",
+			JSONSchema: openAIJSONSchema{Name: "response", Schema: req.ResponseSchema, Strict: true}}
 	}
 	for _, t := range req.Tools {
 		ot := openAITool{Type: "function"}

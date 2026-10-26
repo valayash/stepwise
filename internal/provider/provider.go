@@ -45,6 +45,8 @@ type Request struct {
 	Tools       []ToolDef
 	MaxTokens   int
 	Temperature *float64
+	// ResponseSchema, if set, constrains the final answer to JSON matching it.
+	ResponseSchema json.RawMessage
 }
 
 // Response is a provider-neutral completion result.

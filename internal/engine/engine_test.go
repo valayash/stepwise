@@ -497,6 +497,21 @@ func TestToolCallLimit(t *testing.T) {
 	}
 }
 
+func TestResponseSchema(t *testing.T) {
+	h := newHarness(t, provider.Route{Prefix: "inventor", Provider: &inventor{}})
+	h.start()
+	schema := json.RawMessage(`{"type":"object","properties":{"order_id":{"type":"string"}}}`)
+	ok := h.create(core.AgentSpec{Model: "mock", ResponseSchema: schema}, "order_id: ORD-7", 0)
+	if out := h.waitStatus(ok.ID, core.RunCompleted).Output; out != `{"order_id":"ORD-7"}` {
+		t.Errorf("output = %q", out)
+	}
+	// inventor ignores the schema and answers in prose: callers must not get it as "JSON".
+	bad := h.create(core.AgentSpec{Model: "inventor", ResponseSchema: schema}, "x", 0)
+	if r := h.waitStatus(bad.ID, core.RunFailed); !strings.Contains(r.Error, "not valid JSON") {
+		t.Errorf("error = %q", r.Error)
+	}
+}
+
 func TestTriageToolsOnlyTouchTheirOwnRun(t *testing.T) {
 	h := newHarness(t)
 	e := New(h.cfg, h.deps)

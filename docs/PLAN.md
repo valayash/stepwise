@@ -84,8 +84,9 @@ Core means: agents run reliably, safely and cheaply, and results are usable. No 
       these hosts, so a spec can't reach internal addresses.
 - [x] **Approval expiry.** `"approval_timeout": "24h"` on the agent: unanswered approvals are
       auto-rejected and the model is told why.
-- [ ] **Structured output.** An optional `response_schema` on the agent makes the final answer
-      JSON matching the schema, stored in the existing `output` column.
+- [x] **Structured output.** An optional `response_schema` on the agent makes the final answer
+      JSON matching the schema, stored in the existing `output` column. Uses native structured output
+      (Anthropic `output_config.format`, OpenAI `response_format`): forced tool use 400s on current models.
 - [ ] **Retention.** Optional `STEPWISE_RETENTION_DAYS`: finished runs older than that are deleted.
 
 **Done when:** spending stops at the limit, repeated turns hit the prompt cache, a run can't

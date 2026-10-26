@@ -39,9 +39,13 @@ func TestAnthropicComplete(t *testing.T) {
 			{Role: "system", Content: "be brief"},
 			{Role: "user", Content: "hi"},
 		},
+		ResponseSchema: json.RawMessage(`{"type":"object"}`),
 	})
 	if err != nil {
 		t.Fatalf("Complete: %v", err)
+	}
+	if got.OutputConfig == nil || got.OutputConfig.Format.Type != "json_schema" || string(got.OutputConfig.Format.Schema) != `{"type":"object"}` {
+		t.Errorf("output_config = %+v", got.OutputConfig)
 	}
 
 	if got.System != "be brief" {

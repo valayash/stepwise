@@ -109,10 +109,13 @@ type AgentSpec struct {
 	Limits map[string]int `json:"limits,omitempty"`
 	// ApprovalTimeout (e.g. "24h") rejects a tool call nobody approved in time;
 	// the model is told and can finish without it. Empty waits forever.
-	ApprovalTimeout  string   `json:"approval_timeout,omitempty"`
-	MaxTurns         int      `json:"max_turns,omitempty"` // LLM calls per run, default 20
-	MaxTokensPerCall int      `json:"max_tokens_per_call,omitempty"`
-	Temperature      *float64 `json:"temperature,omitempty"`
+	ApprovalTimeout string `json:"approval_timeout,omitempty"`
+	// ResponseSchema (a JSON Schema object) makes the final answer JSON that
+	// matches it, using the provider's structured-output mode.
+	ResponseSchema   json.RawMessage `json:"response_schema,omitempty"`
+	MaxTurns         int             `json:"max_turns,omitempty"` // LLM calls per run, default 20
+	MaxTokensPerCall int             `json:"max_tokens_per_call,omitempty"`
+	Temperature      *float64        `json:"temperature,omitempty"`
 }
 
 // Defaults applied when a spec leaves a limit unset.
