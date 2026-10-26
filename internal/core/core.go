@@ -100,13 +100,16 @@ type ToolSpec struct {
 
 // AgentSpec defines an agent: model, instructions, tools and limits.
 type AgentSpec struct {
-	Model            string     `json:"model"`
-	System           string     `json:"system,omitempty"`
-	Tools            []ToolSpec `json:"tools,omitempty"`
-	RequireApproval  []string   `json:"require_approval,omitempty"` // tool names that need a human OK
-	MaxTurns         int        `json:"max_turns,omitempty"`        // LLM calls per run, default 20
-	MaxTokensPerCall int        `json:"max_tokens_per_call,omitempty"`
-	Temperature      *float64   `json:"temperature,omitempty"`
+	Model           string     `json:"model"`
+	System          string     `json:"system,omitempty"`
+	Tools           []ToolSpec `json:"tools,omitempty"`
+	RequireApproval []string   `json:"require_approval,omitempty"` // tool names that need a human OK
+	// Limits caps how many times a tool may be called per run, e.g. {"issue_refund": 1}.
+	// Extra calls are returned to the model as errors.
+	Limits           map[string]int `json:"limits,omitempty"`
+	MaxTurns         int            `json:"max_turns,omitempty"` // LLM calls per run, default 20
+	MaxTokensPerCall int            `json:"max_tokens_per_call,omitempty"`
+	Temperature      *float64       `json:"temperature,omitempty"`
 }
 
 // Defaults applied when a spec leaves a limit unset.

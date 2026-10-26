@@ -250,6 +250,11 @@ func (r *Runner) prepare(ctx context.Context, spec core.AgentSpec, depth int) (c
 			return spec, fmt.Errorf("%w: require_approval names unknown tool %q", core.ErrInvalid, n)
 		}
 	}
+	for n, max := range spec.Limits {
+		if !seen[n] || max < 1 {
+			return spec, fmt.Errorf("%w: limits[%q] must name a tool and be at least 1", core.ErrInvalid, n)
+		}
+	}
 	spec.Tools = out
 	return spec.WithDefaults(), nil
 }

@@ -467,13 +467,11 @@ func (x *execution) startTool(ctx context.Context, seq int, tc provider.ToolCall
 	spec, ok := x.run.Spec.Tool(tc.Name)
 	if !ok {
 		// The model invented a tool. Tell it, and let it recover.
-		st, err := x.e.store.BeginStep(ctx, x.f, base)
-		if err != nil {
-			return err
-		}
-		st.Status, st.IsError = core.StepCompleted, true
-		st.Result = fmt.Sprintf("Unknown tool %q. Available tools: %s.", tc.Name, toolNames(x.run.Spec))
-		return x.e.store.SaveStep(ctx, x.f, st)
+		return x.refuseTool(ctx, base, fmt.Sprintf("Unknown tool %q. Available tools: %s.", tc.Name, toolNames(x.run.Spec)))
+	}
+	if limit, ok := x.run.Spec.Limits[tc.Name]; ok && x.toolCalls(tc.Name) >= limit {
+		x.e.m.toolCalls.Inc(string(spec.Type), "limited")
+		return x.refuseTool(ctx, base, fmt.Sprintf("Tool %s may be called at most %d time(s) per run; this call was not made.", tc.Name, limit))
 	}
 
 	if x.run.Spec.NeedsApproval(tc.Name) {
@@ -491,6 +489,27 @@ func (x *execution) startTool(ctx context.Context, seq int, tc provider.ToolCall
 		return err
 	}
 	return x.runTool(ctx, st, spec)
+}
+
+// refuseTool records a tool call that was not made, as an error the model sees.
+func (x *execution) refuseTool(ctx context.Context, base core.Step, msg string) error {
+	st, err := x.e.store.BeginStep(ctx, x.f, base)
+	if err != nil {
+		return err
+	}
+	st.Status, st.IsError, st.Result = core.StepCompleted, true, msg
+	return x.e.store.SaveStep(ctx, x.f, st)
+}
+
+// toolCalls counts this run's earlier calls of a tool (made, pending or refused).
+func (x *execution) toolCalls(name string) int {
+	n := 0
+	for _, s := range x.steps {
+		if s.Kind == core.StepTool && s.ToolName == name {
+			n++
+		}
+	}
+	return n
 }
 
 func (x *execution) execTool(ctx context.Context, st core.Step) error {

@@ -104,7 +104,7 @@ Details and trade-offs: [docs/DESIGN.md](docs/DESIGN.md).
 | **Sub-agents** | A tool can be another agent; children run in parallel as durable runs; tokens roll up to the parent's budget |
 | **Self-healing triage** | When a run fails, a triage agent reads it, records a diagnosis, and asks (with approval) to retry transient failures |
 | **Provider resilience** | Token-bucket rate limits (RPM + TPM) shared by every worker through Redis, circuit breaker per provider, retries with jittered exponential backoff, `Retry-After` support |
-| **Budgets** | Per-run token budget and `max_turns`; runaway agents stop |
+| **Budgets and limits** | Per-run token budget and `max_turns`; per-tool call limits (`"limits": {"issue_refund": 1}`); monthly token limit |
 | **Webhooks** | Transactional outbox; HMAC-SHA256 signatures with timestamps; retries; dead-lettering |
 | **Observability** | OpenTelemetry traces (one trace per run: the trace ID *is* the run ID; `gen_ai.*` attributes; `traceparent` sent to tools); Prometheus metrics; JSON logs; live updates over SSE |
 | **Web UI** | Run list, step timeline with re-execution badges, approvals, cancel/retry — embedded, no build step |

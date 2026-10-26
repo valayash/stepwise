@@ -427,8 +427,12 @@ func TestShutdownHandsRunsBack(t *testing.T) {
 	}
 }
 
-// inventor calls a tool that does not exist, then answers.
-type inventor struct{ calls atomic.Int32 }
+// inventor makes the first-turn tool calls (default: a tool that does not
+// exist), then answers with the last tool result.
+type inventor struct {
+	calls atomic.Int32
+	first []provider.ToolCall
+}
 
 func (i *inventor) Name() string { return "inventor" }
 func (i *inventor) Stream(context.Context, provider.Request, provider.DeltaFunc) (provider.Response, error) {
@@ -436,7 +440,10 @@ func (i *inventor) Stream(context.Context, provider.Request, provider.DeltaFunc)
 }
 func (i *inventor) Complete(_ context.Context, r provider.Request) (provider.Response, error) {
 	if i.calls.Add(1) == 1 {
-		return provider.Response{FinishReason: "tool_calls", ToolCalls: []provider.ToolCall{{ID: "x", Name: "launch_rockets", Input: json.RawMessage(`{}`)}}}, nil
+		if i.first == nil {
+			i.first = []provider.ToolCall{{ID: "x", Name: "launch_rockets", Input: json.RawMessage(`{}`)}}
+		}
+		return provider.Response{FinishReason: "tool_calls", ToolCalls: i.first}, nil
 	}
 	last := r.Messages[len(r.Messages)-1]
 	return provider.Response{FinishReason: "stop", Content: "recovered: " + last.Content}, nil
@@ -449,6 +456,32 @@ func TestModelInventsATool(t *testing.T) {
 	done := h.waitStatus(run.ID, core.RunCompleted)
 	if !strings.Contains(done.Output, "Unknown tool") || !strings.Contains(done.Output, "get_order") {
 		t.Errorf("output = %q", done.Output)
+	}
+}
+
+func TestToolCallLimit(t *testing.T) {
+	order := json.RawMessage(`{"order_id":"ORD-1001"}`)
+	h := newHarness(t, provider.Route{Prefix: "inventor", Provider: &inventor{first: []provider.ToolCall{
+		{ID: "a", Name: "get_order", Input: order}, {ID: "b", Name: "get_order", Input: order},
+	}}})
+	h.start()
+	run := h.create(core.AgentSpec{Model: "inventor", Limits: map[string]int{"get_order": 1},
+		Tools: []core.ToolSpec{{Type: core.ToolMCP, URL: h.shopMC, Include: []string{"get_order"}}}}, "x", 0)
+	done := h.waitStatus(run.ID, core.RunCompleted)
+	if !strings.Contains(done.Output, "at most 1 time") {
+		t.Errorf("output = %q", done.Output)
+	}
+	steps, _ := h.store.ListSteps(context.Background(), run.ID)
+	var made, refused int
+	for _, s := range steps {
+		if s.Kind == core.StepTool && s.IsError {
+			refused++
+		} else if s.Kind == core.StepTool {
+			made++
+		}
+	}
+	if made != 1 || refused != 1 {
+		t.Errorf("tool steps: made %d, refused %d; want 1 and 1", made, refused)
 	}
 }
 

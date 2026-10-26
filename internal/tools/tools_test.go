@@ -141,6 +141,8 @@ func TestPrepareValidation(t *testing.T) {
 		{Model: "m", Tools: []core.ToolSpec{{Type: core.ToolAgent, Name: "sub"}}},
 		{Model: "m", Tools: []core.ToolSpec{{Type: "shell", Name: "s"}}},
 		{Model: "m", RequireApproval: []string{"ghost"}},
+		{Model: "m", Limits: map[string]int{"ghost": 1}},
+		{Model: "m", Tools: []core.ToolSpec{{Type: core.ToolHTTP, Name: "a", URL: "http://x"}}, Limits: map[string]int{"a": 0}},
 		{Model: "m", Tools: []core.ToolSpec{{Type: core.ToolMCP, URL: "http://127.0.0.1:1"}}},
 	}
 	for i, s := range bad {
