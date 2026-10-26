@@ -452,6 +452,41 @@ func (m *Store) PendingApprovals(_ context.Context) ([]core.Step, error) {
 	return out, nil
 }
 
+// DeleteFinished implements store.Store.
+func (m *Store) DeleteFinished(_ context.Context, before time.Time, limit int) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	var del func(id string)
+	del = func(id string) {
+		for cid, c := range m.runs {
+			if c.ParentRunID == id {
+				del(cid)
+			}
+		}
+		delete(m.idem, m.runs[id].IdempotencyKey)
+		delete(m.runs, id)
+		delete(m.steps, id)
+		n++
+	}
+	for id, r := range m.runs {
+		if limit > 0 && r.ParentRunID == "" && r.Status.Terminal() && r.CompletedAt != nil && r.CompletedAt.Before(before) {
+			del(id)
+			limit--
+		}
+	}
+	kept := m.deliveries[:0]
+	for _, d := range m.deliveries {
+		if _, ok := m.runs[d.RunID]; ok {
+			kept = append(kept, d)
+		} else {
+			delete(m.deliveryTo, d.ID)
+		}
+	}
+	m.deliveries = kept
+	return n, nil
+}
+
 // DecideApproval implements store.Store.
 func (m *Store) DecideApproval(_ context.Context, runID string, stepID int64, a core.Approval) error {
 	return m.write(func(now time.Time) ([]store.Event, error) {

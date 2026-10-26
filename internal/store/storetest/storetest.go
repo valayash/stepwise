@@ -344,6 +344,28 @@ func testSubAgent(t *testing.T, s store.Store) {
 	if len(kids) != 1 {
 		t.Errorf("children listed = %d", len(kids))
 	}
+
+	// Retention deletes a finished parent with its sub-agent, and nothing unfinished.
+	p = claimOne(t, s, "w1", time.Minute)
+	if err := s.Finish(ctx, fence(p), store.Outcome{Status: core.RunCompleted}); err != nil {
+		t.Fatal(err)
+	}
+	live := mustCreate(t, s, core.NewRun{Input: "still queued"})
+	if n, err := s.DeleteFinished(ctx, time.Now().Add(-time.Hour), 10); err != nil || n != 0 {
+		t.Errorf("deleting runs finished over an hour ago: %d %v", n, err)
+	}
+	if n, err := s.DeleteFinished(ctx, time.Now().Add(time.Hour), 10); err != nil || n != 2 {
+		t.Errorf("deleted %d runs, %v; want parent and child", n, err)
+	}
+	if _, err := s.GetRun(ctx, child.ID); !errors.Is(err, core.ErrNotFound) {
+		t.Errorf("child survived: %v", err)
+	}
+	if _, err := s.ListSteps(ctx, p.ID); !errors.Is(err, core.ErrNotFound) {
+		t.Errorf("parent steps survived: %v", err)
+	}
+	if _, err := s.GetRun(ctx, live.ID); err != nil {
+		t.Errorf("unfinished run deleted: %v", err)
+	}
 }
 
 func testCancel(t *testing.T, s store.Store) {

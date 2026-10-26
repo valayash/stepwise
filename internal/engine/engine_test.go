@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http/httptest"
@@ -201,6 +202,20 @@ func TestUnansweredApprovalExpires(t *testing.T) {
 	if h.shop.Stats().RefundsIssued != 0 || !strings.Contains(done.Output, "rejected automatically") {
 		t.Errorf("refunds %d, output %q", h.shop.Stats().RefundsIssued, done.Output)
 	}
+}
+
+func TestRetentionDeletesFinishedRuns(t *testing.T) {
+	h := newHarness(t)
+	h.cfg.Retention = time.Millisecond
+	h.start()
+	run := h.create(core.AgentSpec{Model: "mock"}, "hi", 0)
+	h.waitStatus(run.ID, core.RunCompleted)
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		if _, err := h.store.GetRun(context.Background(), run.ID); errors.Is(err, core.ErrNotFound) {
+			return
+		}
+	}
+	t.Error("finished run was not deleted")
 }
 
 func TestCrashAfterSideEffectIsExactlyOnce(t *testing.T) {

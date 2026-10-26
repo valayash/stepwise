@@ -767,6 +767,25 @@ func (s *Store) PendingApprovals(ctx context.Context) ([]core.Step, error) {
 	return scanAll(rows, err, scanStep)
 }
 
+// DeleteFinished implements store.Store. Steps and deliveries cascade;
+// sub-agents are deleted in the same statement as their parent, so the
+// parent_run_id reference holds when it is checked at the end.
+func (s *Store) DeleteFinished(ctx context.Context, before time.Time, limit int) (int, error) {
+	res, err := s.db.ExecContext(ctx, `
+		WITH RECURSIVE doomed AS (
+			(SELECT id FROM runs WHERE parent_run_id IS NULL AND completed_at < $1
+			   AND status IN ('completed', 'failed', 'cancelled') LIMIT $2)
+			UNION ALL
+			SELECT r.id FROM runs r JOIN doomed d ON r.parent_run_id = d.id
+		)
+		DELETE FROM runs WHERE id IN (SELECT id FROM doomed)`, before, limit)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
+}
+
 // DecideApproval implements store.Store.
 func (s *Store) DecideApproval(ctx context.Context, runID string, stepID int64, a core.Approval) error {
 	return s.inTx(ctx, func(tx *sql.Tx) error {

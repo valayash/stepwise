@@ -187,6 +187,7 @@ go run ./cmd/stepwise worker           # in another terminal: more workers, same
 | `STEPWISE_METRICS_ADDR` | — | Metrics + health port for worker-only processes |
 | `STEPWISE_DEMO_SHOP_URL` | — | Shop URL the UI's example uses (reachable by workers) |
 | `STEPWISE_ALLOWED_TOOL_HOSTS` | any | Comma-separated hosts tools may call (`api.shop.com,*.shop.com`), redirects included; set it whenever you run agent specs you don't fully control |
+| `STEPWISE_RETENTION_DAYS` | keep | Delete finished runs (with sub-agents, steps and webhook deliveries) older than this many days |
 | `STEPWISE_MONTHLY_TOKEN_LIMIT` | — | Refuse new runs (HTTP 429) once this month's tokens reach it; see `GET /v1/usage` |
 | `STEPWISE_WEBHOOK_SECRET` | — | HMAC key for webhook signatures |
 | `STEPWISE_SECRET_*` | — | Secrets tool `headers` may reference, e.g. `"Authorization": "Bearer ${STEPWISE_SECRET_SHOP}"`; resolved per call, only sent to the tool's own host, never stored |

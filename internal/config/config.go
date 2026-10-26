@@ -18,6 +18,7 @@ type Config struct {
 	APIToken          string // STEPWISE_API_TOKEN; empty = no auth
 	MaxBodyBytes      int64  // STEPWISE_MAX_BODY_BYTES, default 1 MiB
 	MonthlyTokenLimit int    // STEPWISE_MONTHLY_TOKEN_LIMIT; refuse new runs once this month's usage reaches it
+	RetentionDays     int    // STEPWISE_RETENTION_DAYS; delete finished runs older than this (0 = keep)
 
 	// Providers.
 	AnthropicAPIKey string        // ANTHROPIC_API_KEY; enables claude-* models
@@ -104,6 +105,7 @@ func Load() (Config, error) {
 		{"STEPWISE_WORKERS", &c.Workers},
 		{"STEPWISE_MAX_ATTEMPTS", &c.MaxAttempts},
 		{"STEPWISE_MONTHLY_TOKEN_LIMIT", &c.MonthlyTokenLimit},
+		{"STEPWISE_RETENTION_DAYS", &c.RetentionDays},
 	}
 	for _, i := range ints {
 		if v := os.Getenv(i.env); v != "" {

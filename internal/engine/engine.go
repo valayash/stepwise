@@ -42,6 +42,7 @@ type Config struct {
 	BackoffBase   time.Duration // first retry delay (default 1s)
 	BackoffMax    time.Duration // retry delay cap (default 2m)
 	StepsPerClaim int           // steps before yielding to other runs (default 100)
+	Retention     time.Duration // delete finished runs older than this; 0 keeps them forever
 
 	Triage TriageConfig
 }
@@ -153,6 +154,7 @@ func (e *Engine) Run(ctx context.Context) {
 				return
 			case <-t.C:
 				e.expireApprovals(ctx)
+				e.deleteOldRuns(ctx)
 			}
 		}
 	}()
@@ -194,6 +196,21 @@ func (e *Engine) expireApprovals(ctx context.Context) {
 		if e.store.DecideApproval(ctx, st.RunID, st.ID, core.Approval{Note: note, DecidedBy: "stepwise"}) == nil {
 			e.m.approvals.Inc("expired")
 		}
+	}
+}
+
+// deleteOldRuns applies Retention in batches, so one sweep never holds a
+// long transaction.
+func (e *Engine) deleteOldRuns(ctx context.Context) {
+	if e.cfg.Retention <= 0 {
+		return
+	}
+	for ctx.Err() == nil {
+		n, err := e.store.DeleteFinished(ctx, e.now().Add(-e.cfg.Retention), 500)
+		if err != nil || n == 0 {
+			return
+		}
+		e.log.Info("deleted old runs", "runs", n, "retention", e.cfg.Retention)
 	}
 }
 

@@ -60,6 +60,10 @@ type Store interface {
 	DecideApproval(ctx context.Context, runID string, stepID int64, a core.Approval) error
 	// PendingApprovals lists every tool call waiting for a human, oldest first.
 	PendingApprovals(ctx context.Context) ([]core.Step, error)
+	// DeleteFinished deletes up to limit finished top-level runs that completed
+	// before a time, with their sub-agents, steps and deliveries. It returns
+	// how many runs were deleted, sub-agents included.
+	DeleteFinished(ctx context.Context, before time.Time, limit int) (int, error)
 	Cancel(ctx context.Context, runID string) error
 	// Retry puts a failed run back in the queue with a fresh retry counter.
 	Retry(ctx context.Context, runID string) error
