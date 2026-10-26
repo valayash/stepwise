@@ -9,6 +9,23 @@ and return results by webhook or API. Everything is visible in the built-in dash
 The edge over Temporal, Restate and Claude Managed Agents: one binary plus Postgres, any model,
 exactly-once tools, approvals and an audit trail built in.
 
+## Agents we run
+
+Stepwise is for agents that **take real actions** and must not lose work or repeat it. What we
+target, and what we leave to other tools:
+
+| We target | Example | Why Stepwise fits |
+| --- | --- | --- |
+| **Action agents with approvals** | Support refunds, payouts, account changes, order fixes | Exactly-once tools, `require_approval`, `limits`, audit trail |
+| **Back-office workflows** | KYC and onboarding checks, invoice processing, CRM updates | Long runs survive crashes; JSON results via `response_schema` |
+| **Operations and triage** | IT or ops tickets: investigate, then fix with sign-off | Tools over HTTP/MCP; approvals that can wait days |
+| **Extraction and decisions for programs** | Classify a case, decide eligibility, return JSON | `response_schema`, budgets, spend limit |
+| **Orchestrator with specialists** | Research sub-agents feed a deciding agent | Sub-agents as durable child runs, in parallel |
+
+Not our target (better served elsewhere): coding agents that need a sandbox or computer use,
+real-time voice or chat that needs streamed tokens, open-ended browsing agents, and agent
+"swarms" without a clear leader.
+
 ## Scope for now
 
 - **One user.** Auth is the single static key in `STEPWISE_API_TOKEN` (already supported).
@@ -113,6 +130,19 @@ measurements and should be re-checked when each item is built.
 - [ ] **Fewer writes per step.** `fillfactor` on `runs`, drop the redundant `touch`, lighter
       `lockFenced`.
 - [ ] **Triage storms.** Skip the LLM triage call when the rules already classify a failure as transient.
+
+## Future: multi-agent
+
+Research and fit: [docs/research/multi-agent.md](research/multi-agent.md). Orchestrator–workers
+already works (sub-agents as tools, parallel, durable). Pull these in only when users need them,
+in this order:
+
+- [ ] Cap parallel sub-agents per run (`max_parallel_agents`)
+- [ ] Structured hand-back: a sub-agent's `response_schema` JSON reaches the parent as data
+- [ ] One trace across agents (child traces linked to the parent)
+- [ ] Hand-offs (`"type": "handoff"`: another agent takes over the rest of the run)
+- [ ] A2A: call remote agents as a tool type, then expose Stepwise agents as A2A servers
+- [ ] Shared state / peer messaging, only with strong evidence it's needed
 
 ## Phase 3: Launch
 
