@@ -131,6 +131,27 @@ measurements and should be re-checked when each item is built.
       `lockFenced`.
 - [ ] **Triage storms.** Skip the LLM triage call when the rules already classify a failure as transient.
 
+## Phase 3: Features the common agents need
+
+From the agent catalog ([docs/research/agent-catalog.md](research/agent-catalog.md)): 15 agent
+types people deploy, mapped to the capabilities each needs. Ordered by how many agents each
+unlocks and by dependency.
+
+- [ ] **Conversations (multi-turn runs).** `POST /v1/runs/{id}/messages` adds a user message as
+      a step and reopens the run (the way Retry does); the engine replays it into the model's
+      history. One run = one conversation and one audit trail. Unlocks support, IT and HR bots.
+- [ ] **Documents and images as input.** Runs accept PDFs and images (URL or base64) and pass
+      them to the model natively. Unlocks invoices, KYC, expenses, underwriting, extraction.
+- [ ] **Saved agents with `{{variables}}`.** Store a spec once by name and version, start runs
+      by name with values. Moved up from "Not now": schedules and event triggers depend on it.
+- [ ] **Schedules.** Start a saved agent on a cron schedule. Unlocks reports, reconciliation,
+      collections, payables.
+- [ ] **Hand over to a human.** The agent pauses a conversation for a person, who replies or hands it back.
+- [ ] **Bulk runs and per-agent concurrency caps.** Many runs in one request; cap how many run at once.
+
+Later from the catalog: inbound event webhooks mapped to saved agents, live token streaming,
+evals by replaying saved runs against a new prompt or model, PII redaction.
+
 ## Future: multi-agent
 
 Research and fit: [docs/research/multi-agent.md](research/multi-agent.md). Orchestrator–workers
@@ -144,7 +165,7 @@ in this order:
 - [ ] A2A: call remote agents as a tool type, then expose Stepwise agents as A2A servers
 - [ ] Shared state / peer messaging, only with strong evidence it's needed
 
-## Phase 3: Launch
+## Phase 4: Launch
 
 - [ ] Deploy: one managed host with Postgres (daily backups), TLS and a domain; the API token is set
 - [ ] Docs: a 5-minute `curl` quickstart, API reference, the tool contract (`Idempotency-Key`,
@@ -163,9 +184,8 @@ in this order:
 
 Pulled in only when real users need them:
 
-- Saved agents: create an agent once (with `{{variables}}` in its instructions), then start runs
-  by name with values; an `agents (name, version, spec)` table
-- Live token streaming into the run timeline (ephemeral deltas over the `/events` stream)
+- Live token streaming into the run timeline (ephemeral deltas over the `/events` stream);
+  revisit right after Conversations, since chat is where it matters
 - Usage tab in the UI (the `/v1/usage` API lands with the spend limit)
 - Multi-tenancy: `org_id` on runs, per-org API keys, isolation tests
 - Login and accounts: users, sessions, a signup flow
