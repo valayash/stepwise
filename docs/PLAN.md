@@ -70,24 +70,21 @@ Target rules:
 **Done when:** the dependency test passes, and each of api, worker and webhooks can be started,
 stopped and scaled alone without affecting the others' work.
 
-## Phase 2: Features for real use
+## Phase 2: Core features
 
-Ordered by what a real user hits first:
+Core means: agents run reliably and safely, and results are usable. No new tables or columns.
 
-- [ ] **Saved agents.** `POST /v1/agents` stores a named, versioned spec. Runs start with
-      `{"agent": "refund-agent", "input": "..."}`. Reuses the spec validation (`tools.Prepare`) and store patterns.
+- [ ] **Spend limit.** Optional `STEPWISE_MONTHLY_TOKEN_LIMIT`: new runs are rejected once this
+      month's token usage passes it, so a looping agent can't run up our model bill. One query
+      over `runs.tokens_used`, also exposed as `GET /v1/usage`.
 - [ ] **Structured output.** An optional `response_schema` on the agent makes the final answer
-      JSON matching the schema, returned in `output_json`. Reuses the tool-calling path:
-      the final answer becomes a forced "respond" tool.
-- [ ] **Usage view.** `GET /v1/usage?from=&to=` returns tokens and runs per day per model,
-      with estimated cost. One query over `tokens_used`, which we already record. Adds a usage tab in the UI.
-- [ ] **Live token streaming.** Model text appears in the run timeline as it is generated.
-      Ephemeral deltas go over the existing `/events` stream; the saved step stays the source of truth.
-- [ ] **Spend guard.** Optional `STEPWISE_MONTHLY_TOKEN_LIMIT`: new runs are rejected once
-      this month's usage passes it. Protects our model keys. Reuses the usage query.
+      JSON matching the schema, stored in the existing `output` column. Reuses the tool-calling
+      path: the final answer becomes a forced "respond" tool.
+- [ ] **Retention.** Optional `STEPWISE_RETENTION_DAYS`: finished runs (with their steps and
+      deliveries) older than that are deleted on a schedule, so the database stays bounded.
 
-**Done when:** a user saves an agent once, starts runs by name, gets JSON results, watches
-tokens stream in the UI, and sees what they spent.
+**Done when:** spending stops at the limit, a program gets valid JSON back from a run, and old
+runs are cleaned up automatically.
 
 ## Phase 3: Launch
 
@@ -108,6 +105,10 @@ tokens stream in the UI, and sees what they spent.
 
 Pulled in only when real users need them:
 
+- Saved agents: create an agent once (with `{{variables}}` in its instructions), then start runs
+  by name with values; an `agents (name, version, spec)` table
+- Live token streaming into the run timeline (ephemeral deltas over the `/events` stream)
+- Usage tab in the UI (the `/v1/usage` API lands with the spend limit)
 - Multi-tenancy: `org_id` on runs, per-org API keys, isolation tests
 - Login and accounts: users, sessions, a signup flow
 - Billing: Razorpay and Stripe, plans, prepaid credits
