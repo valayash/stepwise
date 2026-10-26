@@ -36,6 +36,7 @@ type Config struct {
 	BackoffBase  time.Duration // STEPWISE_BACKOFF_BASE, first retry delay, default 1s
 	BackoffMax   time.Duration // STEPWISE_BACKOFF_MAX, retry delay cap, default 2m
 	RateLimits   string        // STEPWISE_RATE_LIMITS, e.g. "claude-=rpm:50,tpm:40000"
+	ToolHosts    string        // STEPWISE_ALLOWED_TOOL_HOSTS, e.g. "api.shop.com,*.shop.com"; empty = any host
 
 	// Webhooks and triage.
 	WebhookSecret   string // STEPWISE_WEBHOOK_SECRET; signs deliveries
@@ -53,6 +54,7 @@ func Load() (Config, error) {
 		DatabaseURL:     os.Getenv("STEPWISE_DATABASE_URL"),
 		RedisURL:        os.Getenv("STEPWISE_REDIS_URL"),
 		RateLimits:      os.Getenv("STEPWISE_RATE_LIMITS"),
+		ToolHosts:       os.Getenv("STEPWISE_ALLOWED_TOOL_HOSTS"),
 		MetricsAddr:     os.Getenv("STEPWISE_METRICS_ADDR"),
 		DemoShopURL:     os.Getenv("STEPWISE_DEMO_SHOP_URL"),
 		APIToken:        os.Getenv("STEPWISE_API_TOKEN"),

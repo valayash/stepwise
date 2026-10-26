@@ -80,7 +80,7 @@ Core means: agents run reliably, safely and cheaply, and results are usable. No 
       message, so each turn doesn't pay full price for the conversation again.
 - [x] **Per-tool call limits.** `"limits": {"issue_refund": 1}` on the agent; extra calls are
       returned to the model as errors, like unknown tools.
-- [ ] **Tool host allowlist.** Optional `STEPWISE_ALLOWED_TOOL_HOSTS`: tools may only call
+- [x] **Tool host allowlist.** Optional `STEPWISE_ALLOWED_TOOL_HOSTS`: tools may only call
       these hosts, so a spec can't reach internal addresses.
 - [ ] **Approval expiry.** `"approval_timeout": "24h"` on the agent: unanswered approvals are
       auto-rejected and the model is told why.

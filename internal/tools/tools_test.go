@@ -207,3 +207,33 @@ func TestToolHeadersResolveSecretsForOwnHostOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestAllowedToolHosts(t *testing.T) {
+	hits := 0
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if r.URL.Path == "/redirect" { // same server under a host name that isn't allowed
+			http.Redirect(w, r, strings.Replace(srv.URL, "127.0.0.1", "localhost", 1)+"/ok", http.StatusFound)
+		}
+	}))
+	defer srv.Close()
+	r := NewRunner()
+	r.AllowedHosts = []string{"127.0.0.1", "*.shop.com"}
+
+	blocked := core.ToolSpec{Type: core.ToolHTTP, Name: "x", URL: "http://169.254.169.254/latest"}
+	if _, err := r.Prepare(ctx, core.AgentSpec{Model: "m", Tools: []core.ToolSpec{blocked}}); !errors.Is(err, core.ErrInvalid) {
+		t.Errorf("prepare with a blocked host: %v", err)
+	}
+	if res, err := r.Run(ctx, Call{Spec: blocked}); err != nil || !res.IsError {
+		t.Errorf("run with a blocked host = %+v %v", res, err)
+	}
+	if _, err := r.Run(ctx, Call{Spec: core.ToolSpec{Type: core.ToolHTTP, Name: "r", URL: srv.URL + "/redirect"}}); err == nil || hits != 1 {
+		t.Errorf("redirect to a blocked host: err=%v hits=%d", err, hits)
+	}
+	for host, want := range map[string]bool{"api.shop.com": true, "shop.com": false, "evilshop.com": false, "127.0.0.1": true} {
+		if r.hostAllowed(host) != want {
+			t.Errorf("hostAllowed(%q) = %v", host, !want)
+		}
+	}
+}

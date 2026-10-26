@@ -59,12 +59,17 @@ type Runner struct {
 	HTTP     *http.Client
 	MCP      *mcp.Client
 	Builtins map[string]Builtin
+	// AllowedHosts, if set, are the only hosts tools may call ("api.shop.com",
+	// "*.shop.com"), so an agent spec can't reach internal addresses.
+	AllowedHosts []string
 }
 
 // NewRunner returns a runner with default clients.
 func NewRunner() *Runner {
-	hc := &http.Client{Transport: headerTransport{http.DefaultTransport}}
-	return &Runner{HTTP: hc, MCP: mcp.NewClient(hc), Builtins: map[string]Builtin{}}
+	r := &Runner{Builtins: map[string]Builtin{}}
+	r.HTTP = &http.Client{Transport: headerTransport{http.DefaultTransport, r.hostAllowed}}
+	r.MCP = mcp.NewClient(r.HTTP)
+	return r
 }
 
 // Run executes one call. The returned error is always a *TransientError (or
@@ -77,6 +82,9 @@ func (r *Runner) Run(ctx context.Context, c Call) (Result, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	ctx, err := withHeaders(ctx, c.Spec)
+	if err == nil {
+		err = r.checkHost(c.Spec)
+	}
 	if err != nil {
 		return Result{Text: err.Error(), IsError: true}, nil
 	}
@@ -176,6 +184,9 @@ func (r *Runner) prepare(ctx context.Context, spec core.AgentSpec, depth int) (c
 	var out []core.ToolSpec
 	for i, t := range spec.Tools {
 		tctx, err := withHeaders(ctx, t)
+		if err == nil {
+			err = r.checkHost(t)
+		}
 		if err != nil {
 			return spec, fmt.Errorf("tools[%d]: %w", i, err)
 		}
@@ -305,11 +316,42 @@ func withHeaders(ctx context.Context, t core.ToolSpec) (context.Context, error) 
 	return context.WithValue(ctx, headersKey{}, toolHeaders{host: u.Host, h: h}), nil
 }
 
-// headerTransport adds a tool's headers to requests for the tool's own host
-// only (never to a redirect target), without overriding Stepwise's headers.
-type headerTransport struct{ next http.RoundTripper }
+func (r *Runner) hostAllowed(host string) bool {
+	if len(r.AllowedHosts) == 0 {
+		return true
+	}
+	host = strings.ToLower(host)
+	for _, a := range r.AllowedHosts {
+		if a == host || strings.HasPrefix(a, "*.") && strings.HasSuffix(host, a[1:]) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkHost rejects HTTP and MCP tools whose URL host is not allowed.
+func (r *Runner) checkHost(t core.ToolSpec) error {
+	if t.Type != core.ToolHTTP && t.Type != core.ToolMCP {
+		return nil
+	}
+	if u, err := url.Parse(t.URL); err != nil || !r.hostAllowed(u.Hostname()) {
+		return fmt.Errorf("%w: tool url %q is not in the allowed tool hosts", core.ErrInvalid, t.URL)
+	}
+	return nil
+}
+
+// headerTransport refuses hosts that aren't allowed (including redirect
+// targets) and adds a tool's headers to requests for the tool's own host
+// only, without overriding Stepwise's headers.
+type headerTransport struct {
+	next  http.RoundTripper
+	allow func(host string) bool
+}
 
 func (t headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if !t.allow(req.URL.Hostname()) {
+		return nil, fmt.Errorf("tool host %s is not allowed", req.URL.Hostname())
+	}
 	th, ok := req.Context().Value(headersKey{}).(toolHeaders)
 	if !ok || req.URL.Host != th.host {
 		return t.next.RoundTrip(req)

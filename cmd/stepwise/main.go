@@ -145,6 +145,11 @@ func run(ctx context.Context, log *slog.Logger, cfg config.Config, r roles) erro
 	reg := metrics.NewRegistry()
 	router, mock := buildRouter(cfg)
 	runner := tools.NewRunner()
+	for _, h := range strings.Split(cfg.ToolHosts, ",") {
+		if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
+			runner.AllowedHosts = append(runner.AllowedHosts, h)
+		}
+	}
 	breakers := breaker.NewSet(5, 30*time.Second, nil)
 
 	rules, err := ratelimit.ParseRules(cfg.RateLimits)
