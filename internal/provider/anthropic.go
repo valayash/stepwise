@@ -1,12 +1,10 @@
 package provider
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 )
@@ -15,7 +13,6 @@ const (
 	anthropicDefaultBaseURL = "https://api.anthropic.com"
 	anthropicVersion        = "2023-06-01"
 	anthropicDefaultMax     = 1024
-	maxSSELine              = 1 << 20 // 1 MiB: largest single SSE line we accept
 )
 
 // Anthropic adapts the Anthropic Messages API to the Provider interface.
@@ -180,16 +177,9 @@ func (a *Anthropic) Complete(ctx context.Context, req Request) (Response, error)
 	if err != nil {
 		return Response{}, err
 	}
-	defer resp.Body.Close()
-
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
-	if err != nil {
-		return Response{}, fmt.Errorf("read anthropic response: %w", err)
-	}
-
 	var ar anthropicResponse
-	if err := json.Unmarshal(raw, &ar); err != nil {
-		return Response{}, fmt.Errorf("decode anthropic response: %w", err)
+	if err := decodeBody(resp, a.Name(), &ar); err != nil {
+		return Response{}, err
 	}
 
 	var text strings.Builder
@@ -219,52 +209,34 @@ func (a *Anthropic) Stream(ctx context.Context, req Request, onDelta DeltaFunc) 
 	if err != nil {
 		return Response{}, err
 	}
-	defer resp.Body.Close()
-
 	var out Response
-	sc := bufio.NewScanner(resp.Body)
-	sc.Buffer(make([]byte, 0, 64<<10), maxSSELine)
-
-	for sc.Scan() {
-		// SSE frames look like "event: <name>\ndata: <json>\n\n". The JSON
-		// repeats the event name in "type", so the data lines are enough.
-		data, ok := strings.CutPrefix(sc.Text(), "data:")
-		if !ok {
-			continue
-		}
+	// SSE frames look like "event: <name>\ndata: <json>\n\n". The JSON
+	// repeats the event name in "type", so the data lines are enough.
+	err = readSSE(ctx, resp, a.Name(), func(data string) (bool, error) {
 		var ev anthropicStreamEvent
-		if err := json.Unmarshal([]byte(strings.TrimSpace(data)), &ev); err != nil {
-			return out, fmt.Errorf("decode anthropic stream event: %w", err)
+		if err := json.Unmarshal([]byte(data), &ev); err != nil {
+			return false, fmt.Errorf("decode anthropic stream event: %w", err)
 		}
-
 		switch ev.Type {
 		case "message_start":
 			out.ID = ev.Message.ID
 			out.InputTokens = ev.Message.Usage.InputTokens
 		case "content_block_delta":
 			if ev.Delta.Type == "text_delta" && ev.Delta.Text != "" {
-				if err := onDelta(ev.Delta.Text); err != nil {
-					return out, err
-				}
+				return false, onDelta(ev.Delta.Text)
 			}
 		case "message_delta":
 			out.FinishReason = mapAnthropicStop(ev.Delta.StopReason)
 			out.OutputTokens = ev.Usage.OutputTokens // cumulative count
 		case "message_stop":
-			return out, nil
+			return true, nil
 		case "error":
-			return out, &StreamError{Provider: a.Name(), Type: ev.Error.Type, Message: ev.Error.Message}
+			return false, &StreamError{Provider: a.Name(), Type: ev.Error.Type, Message: ev.Error.Message}
 		}
 		// ping, content_block_start, content_block_stop: nothing to do.
-	}
-
-	if err := ctx.Err(); err != nil {
-		return out, err // client left or deadline hit; the body read failed because of it
-	}
-	if err := sc.Err(); err != nil {
-		return out, fmt.Errorf("read anthropic stream: %w", err)
-	}
-	return out, ErrIncompleteStream
+		return false, nil
+	})
+	return out, err
 }
 
 // send builds and sends the request, turning non-2xx answers into UpstreamError.
@@ -285,35 +257,13 @@ func (a *Anthropic) send(ctx context.Context, req Request, stream bool) (*http.R
 		body.Tools = append(body.Tools, anthropicTool{Name: t.Name, Description: t.Description, InputSchema: jsonObject(t.InputSchema)})
 	}
 
-	buf, err := json.Marshal(body)
-	if err != nil {
-		return nil, fmt.Errorf("encode anthropic request: %w", err)
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/v1/messages", bytes.NewReader(buf))
-	if err != nil {
-		return nil, fmt.Errorf("build anthropic request: %w", err)
-	}
-	httpReq.Header.Set("content-type", "application/json")
-	httpReq.Header.Set("x-api-key", a.apiKey)
-	httpReq.Header.Set("anthropic-version", anthropicVersion)
+	header := http.Header{}
+	header.Set("x-api-key", a.apiKey)
+	header.Set("anthropic-version", anthropicVersion)
 	if stream {
-		httpReq.Header.Set("accept", "text/event-stream")
+		header.Set("accept", "text/event-stream")
 	}
-
-	resp, err := a.client.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("call anthropic: %w", err)
-	}
-	if resp.StatusCode/100 != 2 {
-		defer resp.Body.Close()
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-		return nil, &UpstreamError{
-			Provider: a.Name(), Status: resp.StatusCode, Body: truncate(string(raw), 512),
-			RetryAfter: resp.Header.Get("retry-after"),
-		}
-	}
-	return resp, nil
+	return postJSON(ctx, a.client, a.Name(), a.baseURL+"/v1/messages", header, body)
 }
 
 func mapAnthropicStop(s string) string {
@@ -325,11 +275,4 @@ func mapAnthropicStop(s string) string {
 	default: // end_turn, stop_sequence
 		return "stop"
 	}
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
 }
