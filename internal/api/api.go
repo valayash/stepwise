@@ -66,15 +66,15 @@ func (s *Server) Handler() http.Handler {
 
 	v1 := http.NewServeMux()
 	v1.HandleFunc("POST /v1/runs", s.createRun)
-	v1.HandleFunc("GET /v1/runs", s.listRuns)
-	v1.HandleFunc("GET /v1/runs/{id}", s.getRun)
+	v1.HandleFunc("GET /v1/runs", s.serveJSON(s.listRuns))
+	v1.HandleFunc("GET /v1/runs/{id}", s.serveJSON(s.getRun))
 	v1.HandleFunc("GET /v1/runs/{id}/events", s.events)
-	v1.HandleFunc("GET /v1/runs/{id}/deliveries", s.deliveries)
-	v1.HandleFunc("POST /v1/runs/{id}/cancel", s.cancel)
-	v1.HandleFunc("POST /v1/runs/{id}/retry", s.retry)
-	v1.HandleFunc("POST /v1/runs/{id}/steps/{step}/approve", s.decide(true))
-	v1.HandleFunc("POST /v1/runs/{id}/steps/{step}/reject", s.decide(false))
-	v1.HandleFunc("GET /v1/approvals", s.approvals)
+	v1.HandleFunc("GET /v1/runs/{id}/deliveries", s.serveJSON(s.deliveries))
+	v1.HandleFunc("POST /v1/runs/{id}/cancel", s.serveJSON(s.mutate(s.Store.Cancel)))
+	v1.HandleFunc("POST /v1/runs/{id}/retry", s.serveJSON(s.mutate(s.Store.Retry)))
+	v1.HandleFunc("POST /v1/runs/{id}/steps/{step}/approve", s.serveJSON(s.decide(true)))
+	v1.HandleFunc("POST /v1/runs/{id}/steps/{step}/reject", s.serveJSON(s.decide(false)))
+	v1.HandleFunc("GET /v1/approvals", s.serveJSON(s.approvals))
 	v1.HandleFunc("GET /v1/info", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, s.Info) })
 	if s.Gateway != nil {
 		v1.Handle("POST /v1/chat/completions", s.Gateway)
@@ -154,7 +154,28 @@ func (s *Server) checkModels(spec core.AgentSpec) error {
 	return nil
 }
 
-func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
+// handlerFunc is a handler whose result is sent as JSON with status 200.
+// It returns errWritten when it already wrote the response itself.
+type handlerFunc func(w http.ResponseWriter, r *http.Request) (any, error)
+
+var errWritten = errors.New("response already written")
+
+// serveJSON adapts a handlerFunc: the result becomes the body, an error becomes
+// the matching status code.
+func (s *Server) serveJSON(fn handlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		v, err := fn(w, r)
+		switch {
+		case errors.Is(err, errWritten):
+		case err != nil:
+			writeErr(w, err)
+		default:
+			writeJSON(w, 200, v)
+		}
+	}
+}
+
+func (s *Server) listRuns(_ http.ResponseWriter, r *http.Request) (any, error) {
 	q := r.URL.Query()
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	if limit <= 0 || limit > 500 {
@@ -163,14 +184,10 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 	runs, err := s.Store.ListRuns(r.Context(), store.ListFilter{
 		Status: core.RunStatus(q.Get("status")), ParentRunID: q.Get("parent_run_id"), Limit: limit,
 	})
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
 	if runs == nil {
 		runs = []core.Run{}
 	}
-	writeJSON(w, 200, map[string]any{"runs": runs})
+	return map[string]any{"runs": runs}, err
 }
 
 type runView struct {
@@ -198,13 +215,8 @@ func (s *Server) view(ctx context.Context, id string) (runView, error) {
 	return runView{Run: run, Steps: steps, Children: kids}, nil
 }
 
-func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
-	v, err := s.view(r.Context(), r.PathValue("id"))
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	writeJSON(w, 200, v)
+func (s *Server) getRun(_ http.ResponseWriter, r *http.Request) (any, error) {
+	return s.view(r.Context(), r.PathValue("id"))
 }
 
 // events streams the run as server-sent events: a full snapshot now, then a
@@ -276,70 +288,47 @@ func (s *Server) isChild(ctx context.Context, childID, parentID string) bool {
 	return err == nil && r.ParentRunID == parentID
 }
 
-func (s *Server) deliveries(w http.ResponseWriter, r *http.Request) {
+func (s *Server) deliveries(_ http.ResponseWriter, r *http.Request) (any, error) {
 	id := r.PathValue("id")
 	if _, err := s.Store.GetRun(r.Context(), id); err != nil {
-		writeErr(w, err)
-		return
+		return nil, err
 	}
 	ds, err := s.Store.ListDeliveries(r.Context(), id)
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
 	if ds == nil {
 		ds = []store.Delivery{}
 	}
-	writeJSON(w, 200, map[string]any{"deliveries": ds})
+	return map[string]any{"deliveries": ds}, err
 }
 
-func (s *Server) cancel(w http.ResponseWriter, r *http.Request) {
-	s.mutate(w, r, s.Store.Cancel)
-}
-
-func (s *Server) retry(w http.ResponseWriter, r *http.Request) {
-	s.mutate(w, r, s.Store.Retry)
-}
-
-func (s *Server) mutate(w http.ResponseWriter, r *http.Request, fn func(context.Context, string) error) {
-	id := r.PathValue("id")
-	if err := fn(r.Context(), id); err != nil {
-		writeErr(w, err)
-		return
+// mutate applies fn (cancel, retry) to the run and returns the run.
+func (s *Server) mutate(fn func(context.Context, string) error) handlerFunc {
+	return func(_ http.ResponseWriter, r *http.Request) (any, error) {
+		id := r.PathValue("id")
+		if err := fn(r.Context(), id); err != nil {
+			return nil, err
+		}
+		return s.Store.GetRun(r.Context(), id)
 	}
-	run, err := s.Store.GetRun(r.Context(), id)
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	writeJSON(w, 200, run)
 }
 
-func (s *Server) decide(approve bool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func (s *Server) decide(approve bool) handlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) (any, error) {
 		stepID, err := strconv.ParseInt(r.PathValue("step"), 10, 64)
 		if err != nil {
-			writeErr(w, fmt.Errorf("%w: step id must be a number", core.ErrInvalid))
-			return
+			return nil, fmt.Errorf("%w: step id must be a number", core.ErrInvalid)
 		}
 		var body struct {
 			Note      string `json:"note"`
 			DecidedBy string `json:"decided_by"`
 		}
 		if r.ContentLength != 0 && !s.decode(w, r, &body) {
-			return
+			return nil, errWritten
 		}
 		id := r.PathValue("id")
 		if err := s.Store.DecideApproval(r.Context(), id, stepID, core.Approval{Approved: approve, Note: body.Note, DecidedBy: body.DecidedBy}); err != nil {
-			writeErr(w, err)
-			return
+			return nil, err
 		}
-		v, err := s.view(r.Context(), id)
-		if err != nil {
-			writeErr(w, err)
-			return
-		}
-		writeJSON(w, 200, v)
+		return s.view(r.Context(), id)
 	}
 }
 
@@ -354,11 +343,10 @@ type pendingApproval struct {
 }
 
 // approvals lists every tool call waiting for a human: an inbox.
-func (s *Server) approvals(w http.ResponseWriter, r *http.Request) {
+func (s *Server) approvals(_ http.ResponseWriter, r *http.Request) (any, error) {
 	runs, err := s.Store.ListRuns(r.Context(), store.ListFilter{Status: core.RunWaiting, Limit: 500})
 	if err != nil {
-		writeErr(w, err)
-		return
+		return nil, err
 	}
 	out := []pendingApproval{}
 	for _, run := range runs {
@@ -375,7 +363,7 @@ func (s *Server) approvals(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	writeJSON(w, 200, map[string]any{"approvals": out})
+	return map[string]any{"approvals": out}, nil
 }
 
 // ---- infrastructure ----
