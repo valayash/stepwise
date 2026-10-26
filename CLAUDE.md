@@ -5,7 +5,7 @@ Durable runtime for AI agents in Go: every step is saved before the next, so run
 ## Direction
 - Open-source, self-hosted, model-agnostic runtime for agents that take real actions (refunds, payouts, account changes): approvals + full audit trail + proof (chaos test).
 - Differentiators vs Temporal / Restate / Claude Managed Agents: one binary + Postgres, data stays on the customer's servers, works with any model, exactly-once tools and approvals built in.
-- Later: multi-tenancy (org_id, per-org API keys, model keys, tool secrets), hosted dashboard, usage billing. Early market to explore: Indian agent startups, fintech/BFSI (self-hosted, data in India).
+- Roadmap and phases: see [docs/PLAN.md](docs/PLAN.md). Work through it in order; tick items as they land.
 
 ## How to write code here
 - Minimal code. Reuse existing helpers and packages before writing anything new; prefer one shared helper over two copies.
