@@ -115,9 +115,9 @@ old runs are cleaned up.
 Ranked by impact for the code it costs. Numbers come from the review's own Postgres
 measurements and should be re-checked when each item is built.
 
-- [ ] **Claim query.** Split `ClaimRuns` into two `LIMIT … SKIP LOCKED` branches, each on its
-      partial index, then `UNION ALL`. Measured: 13.7 ms → 0.2 ms per claim with 2,000 queued,
-      ~7x claims/s.
+- [x] **Claim query.** Split `ClaimRuns` into two `LIMIT … SKIP LOCKED` branches, each on its
+      partial index, then `UNION ALL`. Measured here with pgbench, 16 clients: 512 → 4,677
+      claims/s with 20,000 queued (9x); 3,500 → 6,490 with 2,000 queued.
 - [ ] **Webhook dispatcher wake-ups.** Stop claiming deliveries on every `run_changed` event;
       poll, or wake only on a deliveries event.
 - [ ] **Live view (SSE) queries.** Drop `isChild` (a `GetRun` per fleet event per viewer;

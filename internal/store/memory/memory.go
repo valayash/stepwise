@@ -185,8 +185,12 @@ func (m *Store) ClaimRuns(_ context.Context, owner string, limit int, lease time
 				candidates = append(candidates, r)
 			}
 		}
-		sort.Slice(candidates, func(i, j int) bool {
-			return candidates[i].AvailableAt.Before(candidates[j].AvailableAt)
+		sort.Slice(candidates, func(i, j int) bool { // orphaned runs first, like Postgres
+			a, b := candidates[i], candidates[j]
+			if (a.Status == core.RunRunning) != (b.Status == core.RunRunning) {
+				return a.Status == core.RunRunning
+			}
+			return a.AvailableAt.Before(b.AvailableAt)
 		})
 		if len(candidates) > limit {
 			candidates = candidates[:limit]
