@@ -918,20 +918,27 @@ func (s *Store) Retry(ctx context.Context, runID string) error {
 }
 
 // AddMessage implements store.Store.
-func (s *Store) AddMessage(ctx context.Context, runID, content string) (core.Step, error) {
+func (s *Store) AddMessage(ctx context.Context, runID, content, idempotencyKey string) (core.Step, error) {
 	var out core.Step
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
 		r, err := lockRun(ctx, tx, runID)
 		if err != nil {
 			return err
 		}
+		if idempotencyKey != "" { // the key lives in tool_call_id, unused for user steps
+			out, err = scanStep(tx.QueryRowContext(ctx, `SELECT `+stepCols+` FROM steps
+				WHERE run_id = $1 AND kind = 'user' AND tool_call_id = $2`, runID, idempotencyKey))
+			if !errors.Is(err, core.ErrNotFound) {
+				return err // found (a repeat): nil; or a real error
+			}
+		}
 		if r.Status != core.RunCompleted || r.ParentRunID != "" {
 			return fmt.Errorf("%w: messages continue completed top-level runs (run is %s)", core.ErrNotRunnable, r.Status)
 		}
 		if out, err = scanStep(tx.QueryRowContext(ctx, `
-			INSERT INTO steps (run_id, seq, kind, status, result, completed_at)
-			SELECT $1, COALESCE(max(seq), 0) + 1, 'user', 'completed', $2, now() FROM steps WHERE run_id = $1
-			RETURNING `+stepCols, runID, content)); err != nil {
+			INSERT INTO steps (run_id, seq, kind, status, result, tool_call_id, completed_at)
+			SELECT $1, COALESCE(max(seq), 0) + 1, 'user', 'completed', $2, $3, now() FROM steps WHERE run_id = $1
+			RETURNING `+stepCols, runID, content, idempotencyKey)); err != nil {
 			return err
 		}
 		return reopen(ctx, tx, runID)

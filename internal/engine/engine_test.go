@@ -225,7 +225,7 @@ func TestConversationContinuesARun(t *testing.T) {
 	if out := h.waitStatus(run.ID, core.RunCompleted).Output; out != "mock: hi" {
 		t.Fatalf("first reply = %q", out)
 	}
-	if _, err := h.store.AddMessage(context.Background(), run.ID, "and the second thing?"); err != nil {
+	if _, err := h.store.AddMessage(context.Background(), run.ID, "and the second thing?", ""); err != nil {
 		t.Fatal(err)
 	}
 	if out := h.waitStatus(run.ID, core.RunCompleted).Output; out != "mock: and the second thing?" {

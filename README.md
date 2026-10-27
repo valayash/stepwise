@@ -66,7 +66,7 @@ The run calls `get_order`, then `check_refund_policy`, then asks to call `issue_
 curl -s -X POST localhost:8080/v1/runs/$RUN/steps/$STEP/approve -d '{"decided_by": "yash"}'
 ```
 
-Use `"model": "claude-sonnet-4-5"` (with `ANTHROPIC_API_KEY`) or a `gpt-*` model (with `OPENAI_API_KEY`) for a real model; `mock` is a deterministic agent that costs nothing. More examples in [examples/](examples).
+Use `"model": "claude-sonnet-5-5"` (with `ANTHROPIC_API_KEY`) or a `gpt-*` model (with `OPENAI_API_KEY`) for a real model; `mock` is a deterministic agent that costs nothing. More examples in [examples/](examples).
 
 ## Architecture
 
@@ -166,7 +166,7 @@ go run ./cmd/stepwise worker           # in another terminal: more workers, same
 | `POST` | `/v1/runs/{id}/steps/{step}/approve` · `/reject` | Decide a pending tool call (`note`, `decided_by`) |
 | `POST` | `/v1/runs/{id}/cancel` · `/retry` | Cancel (cascades to sub-agents) · retry a failed run |
 | `POST` | `/v1/runs/{id}/kill` | Simulate a worker crash mid-run (dev/serve only); the run resumes from its saved steps |
-| `POST` | `/v1/runs/{id}/messages` | Continue a completed run as a conversation (`content`); the next reply arrives like any run's output |
+| `POST` | `/v1/runs/{id}/messages` | Continue a completed run as a conversation (`content`); the next reply arrives like any run's output. Send an `Idempotency-Key` header to make retries safe |
 | `GET` | `/v1/approvals` | Inbox of every tool call waiting for a human |
 | `GET` | `/v1/usage` | This month's runs and tokens, and the monthly limit |
 | `GET` | `/v1/runs/{id}/deliveries` | Webhook delivery log |

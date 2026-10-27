@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -198,6 +199,17 @@ func TestKillNeedsWorkersInProcess(t *testing.T) {
 	_, run := e.do("POST", "/v1/runs", `{"agent":{"model":"mock"},"input":"hi"}`)
 	if code, out := e.do("POST", "/v1/runs/"+run["id"].(string)+"/kill", ""); code != 409 || !strings.Contains(fmt.Sprint(out), "kill -9") {
 		t.Errorf("kill without in-process workers = %d %v", code, out)
+	}
+}
+
+func TestTemperatureRejectedForClaude(t *testing.T) {
+	s := &Server{Router: provider.NewRouter(provider.Route{Prefix: "claude-", Provider: provider.NewMock()})}
+	temp := 0.2
+	if err := s.checkModels(core.AgentSpec{Model: "claude-x", Temperature: &temp}); !errors.Is(err, core.ErrInvalid) {
+		t.Errorf("temperature on a Claude model: %v", err)
+	}
+	if err := s.checkModels(core.AgentSpec{Model: "claude-x"}); err != nil {
+		t.Errorf("no temperature: %v", err)
 	}
 }
 

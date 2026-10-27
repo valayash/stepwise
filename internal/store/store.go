@@ -71,7 +71,8 @@ type Store interface {
 	Cancel(ctx context.Context, runID string) error
 	// AddMessage continues a completed top-level run as a conversation: it
 	// saves the message as a user step and queues the run for the next reply.
-	AddMessage(ctx context.Context, runID, content string) (core.Step, error)
+	// A repeated idempotencyKey returns the first message and changes nothing.
+	AddMessage(ctx context.Context, runID, content, idempotencyKey string) (core.Step, error)
 	// Retry puts a failed run back in the queue with a fresh retry counter.
 	Retry(ctx context.Context, runID string) error
 	SetTriage(ctx context.Context, runID string, diagnosis json.RawMessage) error

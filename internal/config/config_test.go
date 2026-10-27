@@ -49,7 +49,7 @@ func TestLoadOverrides(t *testing.T) {
 	if c.Workers != 32 || c.Lease != 10*time.Second || c.MockFailRate != 0.25 || c.RateLimits != "claude-=rpm:50,tpm:40000" || c.TriageEnabled {
 		t.Errorf("overrides not applied: %+v", c)
 	}
-	if c.TriageModel != "claude-sonnet-4-5" {
+	if c.TriageModel != "claude-sonnet-5-5" {
 		t.Errorf("triage model should default to Claude when a key is set, got %q", c.TriageModel)
 	}
 }

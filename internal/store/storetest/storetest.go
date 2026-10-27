@@ -519,7 +519,7 @@ func testListRuns(t *testing.T, s store.Store) {
 func testConversation(t *testing.T, s store.Store) {
 	mustCreate(t, s, core.NewRun{Input: "hi"})
 	r := claimOne(t, s, "w1", time.Minute)
-	if _, err := s.AddMessage(ctx, r.ID, "too early"); !errors.Is(err, core.ErrNotRunnable) {
+	if _, err := s.AddMessage(ctx, r.ID, "too early", ""); !errors.Is(err, core.ErrNotRunnable) {
 		t.Errorf("message to a running run: %v", err)
 	}
 	st, _ := s.BeginStep(ctx, fence(r), core.Step{Seq: 1, Kind: core.StepLLM})
@@ -529,7 +529,7 @@ func testConversation(t *testing.T, s store.Store) {
 		t.Fatal(err)
 	}
 
-	msg, err := s.AddMessage(ctx, r.ID, "and then?")
+	msg, err := s.AddMessage(ctx, r.ID, "and then?", "k1")
 	if err != nil || msg.Kind != core.StepUser || msg.Seq != 2 || msg.Result != "and then?" || msg.Status != core.StepCompleted {
 		t.Fatalf("AddMessage = %+v, %v", msg, err)
 	}
@@ -537,10 +537,18 @@ func testConversation(t *testing.T, s store.Store) {
 	if got.Status != core.RunQueued || got.Output != "" || got.CompletedAt != nil {
 		t.Errorf("run after a message: status %s output %q completed %v", got.Status, got.Output, got.CompletedAt)
 	}
+	// The same key again (a client retry) returns the first message, even
+	// though the run is no longer completed, and adds nothing.
+	if rep, err := s.AddMessage(ctx, r.ID, "and then?", "k1"); err != nil || rep.ID != msg.ID {
+		t.Errorf("repeated key = %+v, %v; want the first message", rep, err)
+	}
+	if steps, _ := s.ListSteps(ctx, r.ID); len(steps) != 2 {
+		t.Errorf("steps after a repeated key = %d, want 2", len(steps))
+	}
 	if again := claimOne(t, s, "w2", time.Minute); again.ID != r.ID {
 		t.Errorf("claimed %s, want the reopened run", again.ID)
 	}
-	if _, err := s.AddMessage(ctx, "nope", "x"); !errors.Is(err, core.ErrNotFound) {
+	if _, err := s.AddMessage(ctx, "nope", "x", ""); !errors.Is(err, core.ErrNotFound) {
 		t.Errorf("message to a missing run: %v", err)
 	}
 }

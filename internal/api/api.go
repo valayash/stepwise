@@ -166,6 +166,10 @@ func (s *Server) checkModels(spec core.AgentSpec) error {
 	if _, err := s.Router.For(spec.Model); err != nil {
 		return fmt.Errorf("%w: %v (configured: %s)", core.ErrInvalid, err, strings.Join(s.Router.Models(), ", "))
 	}
+	if spec.Temperature != nil && strings.HasPrefix(spec.Model, "claude-") {
+		// Current Claude models reject sampling parameters; fail now, not at the first model call.
+		return fmt.Errorf("%w: %s does not accept temperature; remove it", core.ErrInvalid, spec.Model)
+	}
 	for _, t := range spec.Tools {
 		if t.Agent != nil {
 			if err := s.checkModels(*t.Agent); err != nil {
@@ -401,7 +405,7 @@ func (s *Server) addMessage(w http.ResponseWriter, r *http.Request) (any, error)
 		return nil, err
 	}
 	id := r.PathValue("id")
-	if _, err := s.Store.AddMessage(r.Context(), id, body.Content); err != nil {
+	if _, err := s.Store.AddMessage(r.Context(), id, body.Content, r.Header.Get("Idempotency-Key")); err != nil {
 		return nil, err
 	}
 	return s.view(r.Context(), id)

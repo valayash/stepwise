@@ -589,11 +589,17 @@ func (m *Store) Retry(_ context.Context, runID string) error {
 }
 
 // AddMessage implements store.Store.
-func (m *Store) AddMessage(_ context.Context, runID, content string) (out core.Step, err error) {
+func (m *Store) AddMessage(_ context.Context, runID, content, idempotencyKey string) (out core.Step, err error) {
 	err = m.write(func(now time.Time) ([]store.Event, error) {
 		r, ok := m.runs[runID]
 		if !ok {
 			return nil, core.ErrNotFound
+		}
+		for _, s := range m.steps[runID] {
+			if idempotencyKey != "" && s.Kind == core.StepUser && s.ToolCallID == idempotencyKey {
+				out = clone(s) // a repeat: return the first message, change nothing
+				return nil, nil
+			}
 		}
 		if r.Status != core.RunCompleted || r.ParentRunID != "" {
 			return nil, fmt.Errorf("%w: messages continue completed top-level runs (run is %s)", core.ErrNotRunnable, r.Status)
@@ -604,7 +610,7 @@ func (m *Store) AddMessage(_ context.Context, runID, content string) (out core.S
 		}
 		m.nextStep++
 		st := &core.Step{ID: m.nextStep, RunID: runID, Seq: seq, Kind: core.StepUser, Status: core.StepCompleted,
-			Result: content, CreatedAt: now, CompletedAt: &now}
+			Result: content, ToolCallID: idempotencyKey, CreatedAt: now, CompletedAt: &now}
 		m.steps[runID] = append(m.steps[runID], st)
 		out = clone(st)
 		return reopen(r, now), nil

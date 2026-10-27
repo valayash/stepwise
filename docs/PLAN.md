@@ -192,6 +192,9 @@ Pulled in only when real users need them:
 - Live token streaming into the run timeline (ephemeral deltas over the `/events` stream);
   revisit right after Conversations, since chat is where it matters
 - Usage tab in the UI (the `/v1/usage` API lands with the spend limit)
+- Bind each `STEPWISE_SECRET_*` to the host(s) it may be sent to, and require
+  `Content-Type: application/json` on POSTs. Not needed while the single API caller is the
+  operator (security review, Oct 2026), required before callers with different trust levels
 - Multi-tenancy: `org_id` on runs, per-org API keys, isolation tests
 - Login and accounts: users, sessions, a signup flow
 - Billing: Razorpay and Stripe, plans, prepaid credits

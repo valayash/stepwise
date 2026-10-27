@@ -42,7 +42,7 @@ type Config struct {
 	// Webhooks and triage.
 	WebhookSecret   string // STEPWISE_WEBHOOK_SECRET; signs deliveries
 	TriageEnabled   bool   // STEPWISE_TRIAGE, default true
-	TriageModel     string // STEPWISE_TRIAGE_MODEL, default: claude-sonnet-4-5 if a key is set, else mock
+	TriageModel     string // STEPWISE_TRIAGE_MODEL, default: claude-sonnet-5-5 if a key is set, else mock
 	TriageAutoRetry bool   // STEPWISE_TRIAGE_AUTO_RETRY, default false (a human approves retries)
 
 	LogLevel string // STEPWISE_LOG_LEVEL: debug, info, warn, error
@@ -143,7 +143,7 @@ func Load() (Config, error) {
 	if c.TriageModel == "" {
 		c.TriageModel = "mock"
 		if c.AnthropicAPIKey != "" {
-			c.TriageModel = "claude-sonnet-4-5"
+			c.TriageModel = "claude-sonnet-5-5"
 		}
 	}
 	return c, nil
