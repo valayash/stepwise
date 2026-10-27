@@ -53,8 +53,15 @@ export ANTHROPIC_API_KEY=sk-ant-...      # or OPENAI_API_KEY
 go run ./cmd/stepwise dev
 ```
 
-In any example, change `"model": "mock"` to a current model such as `claude-sonnet-5-5`
-(or `gpt-…`). Things worth checking that the mock can't show:
+Then run all the checks below in one go (a few cents of tokens):
+
+```bash
+./examples/level3.sh                          # default claude-opus-5-5; MODEL=claude-sonnet-5-5 or gpt-… to switch
+```
+
+It prints PASS/FAIL per check. Run against `mock` it fails every check, which is expected: the
+mock can't reason. By hand, change `"model": "mock"` in any UI example to a real model.
+What the checks cover:
 
 - **The agent reasons**: it should refuse a refund the policy doesn't allow (try `order_id: ORD-1003`).
 - **Prompt caching works**: after a run with several turns, http://localhost:8080/metrics should
@@ -62,6 +69,9 @@ In any example, change `"model": "mock"` to a current model such as `claude-sonn
   caching isn't taking effect.
 - **Structured output** returns valid JSON from a real model.
 - Don't set `temperature` for current Claude models: they reject it.
+- **Known risk to watch:** current Claude models always think, and Stepwise doesn't yet send the
+  model's thinking blocks back on the next turn. That's accepted by the API but drops the
+  model's reasoning between turns; if multi-step runs look worse than expected, this is why.
 
 ## 4. Production-like (Postgres, separate processes)
 
