@@ -60,6 +60,7 @@ func (c *Config) defaults() {
 	orDefault(&c.BackoffBase, time.Second)
 	orDefault(&c.BackoffMax, 2*time.Minute)
 	orDefault(&c.StepsPerClaim, 100)
+	orDefault(&c.Triage.MaxActive, 10)
 }
 
 // orDefault sets *v to def when it is unset (zero or negative).

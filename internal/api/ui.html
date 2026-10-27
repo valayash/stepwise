@@ -179,7 +179,7 @@ function renderRun(r) {
   const pct = Math.min(100, Math.round(100 * r.tokens_used / r.budget_tokens));
   const terminal = ["completed", "failed", "cancelled"].includes(r.status);
   let triage = "";
-  if (r.triage) { try { const d = JSON.parse(typeof r.triage === "string" ? r.triage : JSON.stringify(r.triage)); triage = `<div class="box"><h3>Triage diagnosis</h3><b>${esc(d.category)}</b> — ${esc(d.summary)} <a href="#" data-go="${d.triage_run_id}">view triage run</a></div>`; } catch {} }
+  if (r.triage) { try { const d = JSON.parse(typeof r.triage === "string" ? r.triage : JSON.stringify(r.triage)); triage = `<div class="box"><h3>Triage diagnosis</h3><b>${esc(d.category)}</b> — ${esc(d.summary)} ${d.triage_run_id ? `<a href="#" data-go="${d.triage_run_id}">view triage run</a>` : `<span class="meta">(by rules, no LLM call)</span>`}</div>`; } catch {} }
   $("#detail").innerHTML = `
     <div class="head"><h2>${r.id}</h2><span class="pill s-${r.status}">${r.status}</span>
       ${r.parent_run_id ? `<span class="meta">sub-agent of <a href="#" data-go="${r.parent_run_id}">${r.parent_run_id.slice(0, 12)}</a></span>` : ""}

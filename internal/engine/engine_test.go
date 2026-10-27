@@ -349,7 +349,7 @@ func TestTransientFailuresAreRetried(t *testing.T) {
 	}
 }
 
-func TestExhaustedRunIsTriagedAndRetriedAfterApproval(t *testing.T) {
+func TestOutageIsDiagnosedByRulesWithoutTriageRun(t *testing.T) {
 	fl := &flaky{Mock: provider.NewMock(), failFirst: 4} // MaxAttempts is 4
 	h := newHarness(t, provider.Route{Prefix: "flaky", Provider: fl})
 	h.cfg.Triage = TriageConfig{Enabled: true, Model: "mock"}
@@ -360,38 +360,50 @@ func TestExhaustedRunIsTriagedAndRetriedAfterApproval(t *testing.T) {
 	if failed.FailureKind != core.FailExhausted || !strings.Contains(failed.Error, "503") {
 		t.Fatalf("failed run = %+v", failed)
 	}
-
-	// The triage agent reads the failure, records a diagnosis, then asks to retry.
-	var triage core.Run
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) && triage.ID == "" {
-		runs, _ := h.store.ListRuns(context.Background(), store.ListFilter{Status: core.RunWaiting})
-		for _, r := range runs {
-			if triageOf(r) == run.ID {
-				triage = r
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if triage.ID == "" {
-		t.Fatal("no triage run waiting for approval")
-	}
-	got, _ := h.store.GetRun(context.Background(), run.ID)
 	var diag map[string]string
-	_ = json.Unmarshal(got.Triage, &diag)
-	if diag["category"] != "transient" || diag["triage_run_id"] != triage.ID {
+	for deadline := time.Now().Add(2 * time.Second); diag == nil && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		got, _ := h.store.GetRun(context.Background(), run.ID)
+		_ = json.Unmarshal(got.Triage, &diag)
+	}
+	if diag["category"] != "transient" || diag["triaged_by"] != "rules" {
 		t.Errorf("diagnosis = %v", diag)
 	}
-
-	for _, s := range h.steps(triage.ID) {
-		if s.Status == core.StepPendingApproval && s.ToolName == toolRetryRun {
-			_ = h.store.DecideApproval(context.Background(), triage.ID, s.ID, core.Approval{Approved: true})
+	runs, _ := h.store.ListRuns(context.Background(), store.ListFilter{})
+	for _, r := range runs {
+		if triageOf(r) != "" {
+			t.Errorf("an outage started an LLM triage run %s", r.ID)
 		}
 	}
-	h.waitStatus(triage.ID, core.RunCompleted)
-	retried := h.waitStatus(run.ID, core.RunCompleted) // the provider has recovered by now
-	if retried.Output != "mock: hello" {
-		t.Errorf("retried run output = %q", retried.Output)
+	_ = h.store.Retry(context.Background(), run.ID) // a person retries once the provider is back
+	if out := h.waitStatus(run.ID, core.RunCompleted).Output; out != "mock: hello" {
+		t.Errorf("retried run output = %q", out)
+	}
+}
+
+func TestTriageAgentRunsForOtherFailuresUpToTheCap(t *testing.T) {
+	h := newHarness(t)
+	h.cfg.Triage = TriageConfig{Enabled: true, Model: "mock", MaxActive: 1}
+	h.start()
+	diagnosis := func(id string) map[string]string {
+		var d map[string]string
+		for deadline := time.Now().Add(5 * time.Second); d == nil && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+			got, _ := h.store.GetRun(context.Background(), id)
+			_ = json.Unmarshal(got.Triage, &d)
+		}
+		return d
+	}
+	// A budget failure isn't an outage: the triage agent diagnoses it, then
+	// waits for approval to retry, so it stays active.
+	first := h.create(shopSpec(h.shopMC), refundPrompt, 1) // needs several model calls; budget runs out after the first
+	h.waitStatus(first.ID, core.RunFailed)
+	if d := diagnosis(first.ID); d["category"] != "budget" || d["triage_run_id"] == "" {
+		t.Fatalf("first diagnosis = %v, want one from a triage run", d)
+	}
+	// With one triage run already active, the next failure is diagnosed by the rules.
+	second := h.create(shopSpec(h.shopMC), refundPrompt, 1)
+	h.waitStatus(second.ID, core.RunFailed)
+	if d := diagnosis(second.ID); d["triaged_by"] != "rules" || !strings.Contains(d["summary"], "already active") {
+		t.Errorf("second diagnosis = %v, want rule-based because of the cap", d)
 	}
 }
 
