@@ -240,6 +240,43 @@ func TestConversationContinuesARun(t *testing.T) {
 	}
 }
 
+func TestKillResumesFromSavedSteps(t *testing.T) {
+	h := newHarness(t)
+	h.mock.Latency = 150 * time.Millisecond // time to kill mid-call
+	h.start()
+	run := h.create(shopSpec(h.shopMC), refundPrompt, 0)
+	var killedSeq int
+	for deadline := time.Now().Add(5 * time.Second); killedSeq == 0 && time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		for _, s := range h.steps(run.ID) {
+			if s.Kind == core.StepLLM && s.Status == core.StepRunning && s.Seq > 1 && h.engine.Kill(run.ID) {
+				killedSeq = s.Seq // killed during a later model call, after earlier steps were saved
+			}
+		}
+	}
+	if killedSeq == 0 {
+		t.Fatal("never caught the run mid-step")
+	}
+	done := h.waitStatus(run.ID, core.RunCompleted)
+	if done.Claims < 2 || h.shop.Stats().RefundsIssued != 1 {
+		t.Errorf("claims %d, refunds %d; want a second claim and exactly one refund", done.Claims, h.shop.Stats().RefundsIssued)
+	}
+	for _, s := range h.steps(run.ID) {
+		if want := 1 + btoi(s.Seq == killedSeq); s.Attempts != want {
+			t.Errorf("step %d ran %d times, want %d (only the interrupted step runs again)", s.Seq, s.Attempts, want)
+		}
+	}
+	if h.engine.Kill(run.ID) {
+		t.Error("killing a finished run should report false")
+	}
+}
+
+func btoi(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 func TestCrashAfterSideEffectIsExactlyOnce(t *testing.T) {
 	h := newHarness(t)
 	spec, _ := h.runner.Prepare(context.Background(), core.AgentSpec{Model: "mock", Tools: []core.ToolSpec{{Type: core.ToolMCP, URL: h.shopMC, Include: []string{"issue_refund"}}}})

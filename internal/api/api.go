@@ -41,6 +41,9 @@ type Server struct {
 	Info Info
 	// MonthlyTokenLimit, if set, refuses new runs once this month's usage reaches it.
 	MonthlyTokenLimit int
+	// Kill, if set, simulates a crash of the worker executing a run (only possible
+	// when the API and workers share a process: dev and serve).
+	Kill func(runID string) bool
 }
 
 // Info describes this deployment to clients and the UI.
@@ -76,6 +79,7 @@ func (s *Server) Handler() http.Handler {
 	v1.HandleFunc("POST /v1/runs/{id}/cancel", s.serveJSON(s.mutate(s.Store.Cancel)))
 	v1.HandleFunc("POST /v1/runs/{id}/retry", s.serveJSON(s.mutate(s.Store.Retry)))
 	v1.HandleFunc("POST /v1/runs/{id}/messages", s.serveJSON(s.addMessage))
+	v1.HandleFunc("POST /v1/runs/{id}/kill", s.serveJSON(s.kill))
 	v1.HandleFunc("POST /v1/runs/{id}/steps/{step}/approve", s.serveJSON(s.decide(true)))
 	v1.HandleFunc("POST /v1/runs/{id}/steps/{step}/reject", s.serveJSON(s.decide(false)))
 	v1.HandleFunc("GET /v1/approvals", s.serveJSON(s.approvals))
@@ -379,6 +383,18 @@ func (s *Server) addMessage(w http.ResponseWriter, r *http.Request) (any, error)
 	id := r.PathValue("id")
 	if _, err := s.Store.AddMessage(r.Context(), id, body.Content); err != nil {
 		return nil, err
+	}
+	return s.view(r.Context(), id)
+}
+
+// kill simulates a worker crash mid-run, to show the run resuming from its saved steps.
+func (s *Server) kill(_ http.ResponseWriter, r *http.Request) (any, error) {
+	id := r.PathValue("id")
+	if s.Kill == nil {
+		return nil, fmt.Errorf("%w: kill works when the API and workers run in one process (dev, serve); otherwise kill -9 a worker", core.ErrNotRunnable)
+	}
+	if !s.Kill(id) {
+		return nil, fmt.Errorf("%w: run is not executing right now (it may be waiting, queued or finished)", core.ErrNotRunnable)
 	}
 	return s.view(r.Context(), id)
 }

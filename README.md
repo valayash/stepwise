@@ -165,6 +165,7 @@ go run ./cmd/stepwise worker           # in another terminal: more workers, same
 | `GET` | `/v1/runs/{id}/events` | Live updates (server-sent events) until the run ends |
 | `POST` | `/v1/runs/{id}/steps/{step}/approve` · `/reject` | Decide a pending tool call (`note`, `decided_by`) |
 | `POST` | `/v1/runs/{id}/cancel` · `/retry` | Cancel (cascades to sub-agents) · retry a failed run |
+| `POST` | `/v1/runs/{id}/kill` | Simulate a worker crash mid-run (dev/serve only); the run resumes from its saved steps |
 | `POST` | `/v1/runs/{id}/messages` | Continue a completed run as a conversation (`content`); the next reply arrives like any run's output |
 | `GET` | `/v1/approvals` | Inbox of every tool call waiting for a human |
 | `GET` | `/v1/usage` | This month's runs and tokens, and the monthly limit |

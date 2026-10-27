@@ -47,8 +47,18 @@ The header shows this month's tokens against the limit and how many approvals ar
 see the spend limit refuse runs, restart with `STEPWISE_MONTHLY_TOKEN_LIMIT=1000` and start a
 few runs: new ones fail with HTTP 429 "monthly token limit … reached".
 
-Crash recovery by hand: start a refund, and while it waits for approval stop the server (Ctrl+C)
-and start it again. In `dev` mode data is in memory, so this needs Postgres (level 4).
+**Crash recovery (Kill worker):** start the server with slow model calls so there's time to click:
+
+```bash
+STEPWISE_MOCK_LATENCY=3s go run ./cmd/stepwise dev
+```
+
+Start **Refund with approval**, and while a model step is **running** (after #1 and #2 are
+done), click **Kill worker**. The worker stops mid-step like a crash: nothing is saved and the
+run isn't handed back. Within a few seconds another claim picks it up: steps already done are
+**not** repeated, only the interrupted one runs again (badge **re-executed ×2**), and **Claims**
+goes up. Approve it and it finishes with exactly one refund. API: `POST /v1/runs/{id}/kill`.
+For a real process kill, use `kill -9` on a worker in level 4.
 
 ## 3. With a real model
 

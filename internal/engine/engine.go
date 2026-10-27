@@ -80,6 +80,9 @@ type Engine struct {
 	log      *slog.Logger
 	m        *Metrics
 	now      func() time.Time
+
+	killMu sync.Mutex
+	kills  map[string]func() // runs this process is executing → simulate a crash
 }
 
 // Deps are the engine's collaborators. Limiter, Breakers, Logger and Metrics are optional.
@@ -172,6 +175,20 @@ func (e *Engine) Run(ctx context.Context) {
 	e.log.Info("engine stopped")
 }
 
+// Kill simulates a crash of the worker executing a run in this process, for
+// demos and tests: it stops mid-step without saving or handing the run back,
+// and the next claim resumes from the saved steps. It reports whether the run
+// was executing here.
+func (e *Engine) Kill(runID string) bool {
+	e.killMu.Lock()
+	kill, ok := e.kills[runID]
+	if ok {
+		kill() // killed is set under killMu, which Process also takes to read it
+	}
+	e.killMu.Unlock()
+	return ok
+}
+
 // expireApprovals rejects tool calls that waited longer than their agent's
 // approval_timeout. Every worker process sweeps; a call already decided by
 // another one is simply skipped.
@@ -258,6 +275,15 @@ func (e *Engine) Process(ctx context.Context, run core.Run) {
 	defer cancel()
 	log := e.log.With("run_id", run.ID, "claim", run.Claims)
 
+	var killed bool // read after cancel() and the heartbeat have stopped
+	e.killMu.Lock()
+	if e.kills == nil {
+		e.kills = map[string]func(){}
+	}
+	e.kills[run.ID] = func() { killed = true; cancel() }
+	e.killMu.Unlock()
+	defer func() { e.killMu.Lock(); delete(e.kills, run.ID); e.killMu.Unlock() }()
+
 	// Heartbeat: keep the lease alive; stop everything if it is lost.
 	var lost bool
 	var lostMu sync.Mutex
@@ -304,7 +330,16 @@ func (e *Engine) Process(ctx context.Context, run core.Run) {
 	lostMu.Lock()
 	wasLost := lost
 	lostMu.Unlock()
+	e.killMu.Lock()
+	wasKilled := killed
+	e.killMu.Unlock()
 	switch {
+	case wasKilled:
+		// Simulated crash: nothing is saved or handed back. Only the lease is
+		// expired now, so the demo doesn't wait for it to time out.
+		span.SetAttributes(attribute.String("stepwise.claim.outcome", "killed"))
+		log.Warn("worker killed (simulated crash); another claim resumes from saved steps")
+		_ = e.store.Heartbeat(context.WithoutCancel(ctx), f, 0)
 	case errors.Is(err, core.ErrFenced) || wasLost:
 		e.m.leaseLost.Inc()
 		span.SetAttributes(attribute.String("stepwise.claim.outcome", "lease_lost"))

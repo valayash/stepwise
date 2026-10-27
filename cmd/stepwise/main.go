@@ -220,6 +220,7 @@ func run(ctx context.Context, log *slog.Logger, cfg config.Config, r roles) erro
 				Store: st, Tools: runner, Router: router, Token: cfg.APIToken,
 				Metrics: reg.Handler(), Gateway: gw.Handler(), Log: log, MaxBodyBytes: cfg.MaxBodyBytes,
 				MonthlyTokenLimit: cfg.MonthlyTokenLimit,
+				Kill:              killFunc(r, eng),
 				Info:              api.Info{Version: version, Mode: modeName(r), Models: router.Models(), DemoShopURL: shopURL},
 			}).Handler())
 		}
@@ -266,6 +267,14 @@ func run(ctx context.Context, log *slog.Logger, cfg config.Config, r roles) erro
 	log.Info("shutting down")
 	wg.Wait()
 	return nil
+}
+
+// killFunc lets the API simulate worker crashes, only when it shares a process with them.
+func killFunc(r roles, eng *engine.Engine) func(string) bool {
+	if !r.worker {
+		return nil
+	}
+	return eng.Kill
 }
 
 func modeName(r roles) string {

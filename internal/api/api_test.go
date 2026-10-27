@@ -193,6 +193,14 @@ func TestConversationOverHTTP(t *testing.T) {
 	}
 }
 
+func TestKillNeedsWorkersInProcess(t *testing.T) {
+	e := setup(t, "") // like `stepwise api`: no workers in this process
+	_, run := e.do("POST", "/v1/runs", `{"agent":{"model":"mock"},"input":"hi"}`)
+	if code, out := e.do("POST", "/v1/runs/"+run["id"].(string)+"/kill", ""); code != 409 || !strings.Contains(fmt.Sprint(out), "kill -9") {
+		t.Errorf("kill without in-process workers = %d %v", code, out)
+	}
+}
+
 func TestIdempotencyKeyHeader(t *testing.T) {
 	e := setup(t, "")
 	body := `{"agent":{"model":"mock"},"input":"hi"}`
