@@ -12,3 +12,9 @@ scrape_configs:
       - names: ["worker"]
         type: A
         port: 9091
+
+  - job_name: stepwise-webhooks
+    dns_sd_configs:
+      - names: ["webhooks"]
+        type: A
+        port: 9091

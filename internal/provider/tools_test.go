@@ -108,9 +108,14 @@ func TestOpenAIToolRoundTrip(t *testing.T) {
 		Model:    "gpt-x",
 		Messages: agentConversation(),
 		Tools:    []ToolDef{{Name: "get_order", InputSchema: refundSchema}},
+		// Structured output rides alongside tools.
+		ResponseSchema: json.RawMessage(`{"type":"object"}`),
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if rf, _ := got["response_format"].(map[string]any); rf["type"] != "json_schema" || rf["json_schema"].(map[string]any)["strict"] != true {
+		t.Errorf("response_format = %v", got["response_format"])
 	}
 
 	// Request shape: tool calls carry arguments as a JSON string; tool results use role "tool".

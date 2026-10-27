@@ -42,6 +42,7 @@ type Config struct {
 	BackoffBase   time.Duration // first retry delay (default 1s)
 	BackoffMax    time.Duration // retry delay cap (default 2m)
 	StepsPerClaim int           // steps before yielding to other runs (default 100)
+	Retention     time.Duration // delete finished runs older than this; 0 keeps them forever
 
 	Triage TriageConfig
 }
@@ -51,29 +52,21 @@ func (c *Config) defaults() {
 		host, _ := os.Hostname()
 		c.WorkerID = fmt.Sprintf("%s-%d-%04x", host, os.Getpid(), rand.IntN(1<<16))
 	}
-	if c.Workers <= 0 {
-		c.Workers = 8
-	}
-	if c.Lease <= 0 {
-		c.Lease = 30 * time.Second
-	}
-	if c.PollInterval <= 0 {
-		c.PollInterval = time.Second
-	}
-	if c.LLMTimeout <= 0 {
-		c.LLMTimeout = 2 * time.Minute
-	}
-	if c.MaxAttempts <= 0 {
-		c.MaxAttempts = 6
-	}
-	if c.BackoffBase <= 0 {
-		c.BackoffBase = time.Second
-	}
-	if c.BackoffMax <= 0 {
-		c.BackoffMax = 2 * time.Minute
-	}
-	if c.StepsPerClaim <= 0 {
-		c.StepsPerClaim = 100
+	orDefault(&c.Workers, 8)
+	orDefault(&c.Lease, 30*time.Second)
+	orDefault(&c.PollInterval, time.Second)
+	orDefault(&c.LLMTimeout, 2*time.Minute)
+	orDefault(&c.MaxAttempts, 6)
+	orDefault(&c.BackoffBase, time.Second)
+	orDefault(&c.BackoffMax, 2*time.Minute)
+	orDefault(&c.StepsPerClaim, 100)
+	orDefault(&c.Triage.MaxActive, 10)
+}
+
+// orDefault sets *v to def when it is unset (zero or negative).
+func orDefault[T int | time.Duration](v *T, def T) {
+	if *v <= 0 {
+		*v = def
 	}
 }
 
@@ -88,6 +81,9 @@ type Engine struct {
 	log      *slog.Logger
 	m        *Metrics
 	now      func() time.Time
+
+	killMu sync.Mutex
+	kills  map[string]func() // runs this process is executing → simulate a crash
 }
 
 // Deps are the engine's collaborators. Limiter, Breakers, Logger and Metrics are optional.
@@ -153,6 +149,20 @@ func (e *Engine) Run(ctx context.Context) {
 		}
 	}()
 
+	go func() {
+		t := time.NewTicker(30 * e.cfg.PollInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				e.expireApprovals(ctx)
+				e.deleteOldRuns(ctx)
+			}
+		}
+	}()
+
 	var wg sync.WaitGroup
 	for i := 0; i < e.cfg.Workers; i++ {
 		wg.Add(1)
@@ -164,6 +174,62 @@ func (e *Engine) Run(ctx context.Context) {
 	e.log.Info("engine started", "workers", e.cfg.Workers, "lease", e.cfg.Lease)
 	wg.Wait()
 	e.log.Info("engine stopped")
+}
+
+// Kill simulates a crash of the worker executing a run in this process, for
+// demos and tests: it stops mid-step without saving or handing the run back,
+// and the next claim resumes from the saved steps. It reports whether the run
+// was executing here.
+func (e *Engine) Kill(runID string) bool {
+	e.killMu.Lock()
+	kill, ok := e.kills[runID]
+	if ok {
+		kill() // killed is set under killMu, which Process also takes to read it
+	}
+	e.killMu.Unlock()
+	return ok
+}
+
+// expireApprovals rejects tool calls that waited longer than their agent's
+// approval_timeout. Every worker process sweeps; a call already decided by
+// another one is simply skipped.
+func (e *Engine) expireApprovals(ctx context.Context) {
+	steps, err := e.store.PendingApprovals(ctx)
+	if err != nil {
+		return
+	}
+	ttl := map[string]time.Duration{}
+	for _, st := range steps {
+		d, ok := ttl[st.RunID]
+		if !ok {
+			if run, err := e.store.GetRun(ctx, st.RunID); err == nil {
+				d = run.Spec.ApprovalTTL()
+			}
+			ttl[st.RunID] = d
+		}
+		if d <= 0 || e.now().Sub(st.CreatedAt) < d {
+			continue
+		}
+		note := fmt.Sprintf("No decision within %s; rejected automatically.", d)
+		if e.store.DecideApproval(ctx, st.RunID, st.ID, core.Approval{Note: note, DecidedBy: "stepwise"}) == nil {
+			e.m.approvals.Inc("expired")
+		}
+	}
+}
+
+// deleteOldRuns applies Retention in batches, so one sweep never holds a
+// long transaction.
+func (e *Engine) deleteOldRuns(ctx context.Context) {
+	if e.cfg.Retention <= 0 {
+		return
+	}
+	for ctx.Err() == nil {
+		n, err := e.store.DeleteFinished(ctx, e.now().Add(-e.cfg.Retention), 500)
+		if err != nil || n == 0 {
+			return
+		}
+		e.log.Info("deleted old runs", "runs", n, "retention", e.cfg.Retention)
+	}
 }
 
 func (e *Engine) workerLoop(ctx context.Context, wake <-chan struct{}) {
@@ -209,6 +275,15 @@ func (e *Engine) Process(ctx context.Context, run core.Run) {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	log := e.log.With("run_id", run.ID, "claim", run.Claims)
+
+	var killed bool // read after cancel() and the heartbeat have stopped
+	e.killMu.Lock()
+	if e.kills == nil {
+		e.kills = map[string]func(){}
+	}
+	e.kills[run.ID] = func() { killed = true; cancel() }
+	e.killMu.Unlock()
+	defer func() { e.killMu.Lock(); delete(e.kills, run.ID); e.killMu.Unlock() }()
 
 	// Heartbeat: keep the lease alive; stop everything if it is lost.
 	var lost bool
@@ -256,7 +331,16 @@ func (e *Engine) Process(ctx context.Context, run core.Run) {
 	lostMu.Lock()
 	wasLost := lost
 	lostMu.Unlock()
+	e.killMu.Lock()
+	wasKilled := killed
+	e.killMu.Unlock()
 	switch {
+	case wasKilled:
+		// Simulated crash: nothing is saved or handed back. Only the lease is
+		// expired now, so the demo doesn't wait for it to time out.
+		span.SetAttributes(attribute.String("stepwise.claim.outcome", "killed"))
+		log.Warn("worker killed (simulated crash); another claim resumes from saved steps")
+		_ = e.store.Heartbeat(context.WithoutCancel(ctx), f, 0)
 	case errors.Is(err, core.ErrFenced) || wasLost:
 		e.m.leaseLost.Inc()
 		span.SetAttributes(attribute.String("stepwise.claim.outcome", "lease_lost"))
@@ -319,6 +403,10 @@ func (x *execution) do(ctx context.Context, a action) error {
 	case actExecTool:
 		return x.execTool(ctx, *a.step)
 	case actComplete:
+		if len(x.run.Spec.ResponseSchema) > 0 && !json.Valid([]byte(a.output)) {
+			// A refusal or a max_tokens cut can still break the schema; callers rely on JSON.
+			return x.finish(ctx, store.Outcome{Status: core.RunFailed, FailureKind: core.FailFatal, Error: "final answer is not valid JSON for response_schema"})
+		}
 		return x.finish(ctx, store.Outcome{Status: core.RunCompleted, Output: a.output})
 	case actFail:
 		return x.finish(ctx, store.Outcome{Status: core.RunFailed, Error: a.reason, FailureKind: a.fail})
@@ -342,26 +430,10 @@ func (x *execution) callLLM(ctx context.Context, seq int) error {
 	msgs := conversation(x.run, x.steps)
 	toolDefs := spec.ToolDefs()
 
-	// Circuit breaker first (cheap, local), then the shared rate limiter.
 	br := x.e.breakers.Get(p.Name())
-	if ok, wait := br.Allow(); !ok {
-		x.e.m.breakerRejected.Inc(p.Name())
-		trace.SpanFromContext(ctx).AddEvent("circuit_open", trace.WithAttributes(attribute.String("gen_ai.system", p.Name())))
-		return x.yield(ctx, store.Yield{Status: core.RunQueued, AvailableAt: x.e.now().Add(wait), Attempts: x.run.Attempts, Error: p.Name() + " circuit open"})
-	}
-	estimate := ratelimit.EstimateTokens(promptChars(msgs, toolDefs), maxTokens)
-	wait, err := x.e.limiter.Reserve(ctx, model, estimate)
+	estimate, err := x.admit(ctx, br, p.Name(), model, ratelimit.EstimateTokens(promptChars(msgs, toolDefs), maxTokens))
 	if err != nil {
-		// Fail open: a limiter outage should not stop every agent. Providers
-		// still enforce their own limits, which we handle as retries.
-		x.log.Warn("rate limiter unavailable; proceeding", "err", err)
-		estimate = 0
-	} else if wait > 0 {
-		br.Abort()
-		x.e.m.rateLimited.Inc(model)
-		trace.SpanFromContext(ctx).AddEvent("rate_limited", trace.WithAttributes(
-			attribute.String("gen_ai.request.model", model), attribute.Int64("stepwise.wait_ms", wait.Milliseconds())))
-		return x.yield(ctx, store.Yield{Status: core.RunQueued, AvailableAt: x.e.now().Add(wait), Attempts: x.run.Attempts})
+		return err
 	}
 
 	step, err := x.e.store.BeginStep(ctx, x.f, core.Step{Seq: seq, Kind: core.StepLLM})
@@ -386,23 +458,19 @@ func (x *execution) callLLM(ctx context.Context, seq int) error {
 	start := x.e.now()
 	resp, err := p.Complete(callCtx, provider.Request{
 		Model: model, Messages: msgs, Tools: toolDefs, MaxTokens: maxTokens, Temperature: spec.Temperature,
+		ResponseSchema: spec.ResponseSchema, Cache: true,
 	})
 	cancel()
 	elapsed := x.e.now().Sub(start)
 	x.e.m.llmSeconds.Observe(elapsed.Seconds(), p.Name())
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-	} else {
-		span.SetAttributes(
-			attribute.String("gen_ai.response.id", resp.ID),
-			attribute.StringSlice("gen_ai.response.finish_reasons", []string{resp.FinishReason}),
-			attribute.Int("gen_ai.usage.input_tokens", resp.InputTokens),
-			attribute.Int("gen_ai.usage.output_tokens", resp.OutputTokens),
-			attribute.Int("stepwise.tool_calls", len(resp.ToolCalls)),
-		)
-	}
-	span.End()
+	endSpan(span, err,
+		attribute.String("gen_ai.response.id", resp.ID),
+		attribute.StringSlice("gen_ai.response.finish_reasons", []string{resp.FinishReason}),
+		attribute.Int("gen_ai.usage.input_tokens", resp.InputTokens),
+		attribute.Int("gen_ai.usage.cache_read_input_tokens", resp.CachedTokens),
+		attribute.Int("gen_ai.usage.output_tokens", resp.OutputTokens),
+		attribute.Int("stepwise.tool_calls", len(resp.ToolCalls)),
+	)
 
 	if err != nil {
 		_ = x.e.limiter.Settle(context.WithoutCancel(ctx), model, -estimate)
@@ -426,6 +494,7 @@ func (x *execution) callLLM(ctx context.Context, seq int) error {
 	x.e.m.llmCalls.Inc(p.Name(), "ok")
 	x.e.m.tokens.Add(float64(resp.InputTokens), model, "input")
 	x.e.m.tokens.Add(float64(resp.OutputTokens), model, "output")
+	x.e.m.tokens.Add(float64(resp.CachedTokens), model, "cached_input") // part of input; watch it to confirm caching works
 
 	step.Status = core.StepCompleted
 	step.LLM = &resp
@@ -437,6 +506,33 @@ func (x *execution) callLLM(ctx context.Context, seq int) error {
 	x.run.Attempts = 0
 	x.e.m.steps.Inc(string(core.StepLLM))
 	return nil
+}
+
+// admit asks the circuit breaker (cheap, local), then the shared rate
+// limiter, for permission to call the model. If either says "not now", the
+// run goes back to the queue and admit returns errStop. It returns the token
+// estimate actually reserved, which the caller settles after the call.
+func (x *execution) admit(ctx context.Context, br *breaker.Breaker, system, model string, estimate int) (int, error) {
+	if ok, wait := br.Allow(); !ok {
+		x.e.m.breakerRejected.Inc(system)
+		trace.SpanFromContext(ctx).AddEvent("circuit_open", trace.WithAttributes(attribute.String("gen_ai.system", system)))
+		return 0, x.yield(ctx, store.Yield{Status: core.RunQueued, AvailableAt: x.e.now().Add(wait), Attempts: x.run.Attempts, Error: system + " circuit open"})
+	}
+	wait, err := x.e.limiter.Reserve(ctx, model, estimate)
+	if err != nil {
+		// Fail open: a limiter outage should not stop every agent. Providers
+		// still enforce their own limits, which we handle as retries.
+		x.log.Warn("rate limiter unavailable; proceeding", "err", err)
+		return 0, nil
+	}
+	if wait > 0 {
+		br.Abort()
+		x.e.m.rateLimited.Inc(model)
+		trace.SpanFromContext(ctx).AddEvent("rate_limited", trace.WithAttributes(
+			attribute.String("gen_ai.request.model", model), attribute.Int64("stepwise.wait_ms", wait.Milliseconds())))
+		return 0, x.yield(ctx, store.Yield{Status: core.RunQueued, AvailableAt: x.e.now().Add(wait), Attempts: x.run.Attempts})
+	}
+	return estimate, nil
 }
 
 // retryLater hands the run back with exponential backoff, or fails it once
@@ -469,13 +565,11 @@ func (x *execution) startTool(ctx context.Context, seq int, tc provider.ToolCall
 	spec, ok := x.run.Spec.Tool(tc.Name)
 	if !ok {
 		// The model invented a tool. Tell it, and let it recover.
-		st, err := x.e.store.BeginStep(ctx, x.f, base)
-		if err != nil {
-			return err
-		}
-		st.Status, st.IsError = core.StepCompleted, true
-		st.Result = fmt.Sprintf("Unknown tool %q. Available tools: %s.", tc.Name, toolNames(x.run.Spec))
-		return x.e.store.SaveStep(ctx, x.f, st)
+		return x.refuseTool(ctx, base, fmt.Sprintf("Unknown tool %q. Available tools: %s.", tc.Name, toolNames(x.run.Spec)))
+	}
+	if limit, ok := x.run.Spec.Limits[tc.Name]; ok && x.toolCalls(tc.Name) >= limit {
+		x.e.m.toolCalls.Inc(string(spec.Type), "limited")
+		return x.refuseTool(ctx, base, fmt.Sprintf("Tool %s may be called at most %d time(s) per run; this call was not made.", tc.Name, limit))
 	}
 
 	if x.run.Spec.NeedsApproval(tc.Name) {
@@ -493,6 +587,27 @@ func (x *execution) startTool(ctx context.Context, seq int, tc provider.ToolCall
 		return err
 	}
 	return x.runTool(ctx, st, spec)
+}
+
+// refuseTool records a tool call that was not made, as an error the model sees.
+func (x *execution) refuseTool(ctx context.Context, base core.Step, msg string) error {
+	st, err := x.e.store.BeginStep(ctx, x.f, base)
+	if err != nil {
+		return err
+	}
+	st.Status, st.IsError, st.Result = core.StepCompleted, true, msg
+	return x.e.store.SaveStep(ctx, x.f, st)
+}
+
+// toolCalls counts this run's earlier calls of a tool (made, pending or refused).
+func (x *execution) toolCalls(name string) int {
+	n := 0
+	for _, s := range x.steps {
+		if s.Kind == core.StepTool && s.ToolName == name {
+			n++
+		}
+	}
+	return n
 }
 
 func (x *execution) execTool(ctx context.Context, st core.Step) error {
@@ -533,13 +648,7 @@ func (x *execution) runTool(ctx context.Context, st core.Step, spec core.ToolSpe
 	})
 	elapsed := x.e.now().Sub(start)
 	x.e.m.toolSeconds.Observe(elapsed.Seconds(), string(spec.Type))
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-	} else {
-		span.SetAttributes(attribute.Bool("stepwise.tool.is_error", res.IsError))
-	}
-	span.End()
+	endSpan(span, err, attribute.Bool("stepwise.tool.is_error", res.IsError))
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -617,6 +726,17 @@ func (x *execution) finish(ctx context.Context, o store.Outcome) error {
 }
 
 // ---- helpers ----
+
+// endSpan records err on span, or the success attributes when there is none.
+func endSpan(span trace.Span, err error, ok ...attribute.KeyValue) {
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	} else {
+		span.SetAttributes(ok...)
+	}
+	span.End()
+}
 
 func promptChars(msgs []provider.Message, defs []provider.ToolDef) int {
 	n := 0

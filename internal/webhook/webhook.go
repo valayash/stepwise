@@ -94,10 +94,19 @@ func (d *Dispatcher) Run(ctx context.Context) {
 		if n > 0 {
 			continue // there may be more
 		}
-		select {
-		case <-ctx.Done():
-		case <-events:
-		case <-time.After(d.Interval):
+		wait := time.After(d.Interval)
+	idle:
+		for {
+			select {
+			case <-ctx.Done():
+				break idle
+			case ev := <-events:
+				if ev.Type == store.EventDeliveries {
+					break idle
+				}
+			case <-wait:
+				break idle
+			}
 		}
 	}
 }

@@ -45,6 +45,12 @@ type Request struct {
 	Tools       []ToolDef
 	MaxTokens   int
 	Temperature *float64
+	// ResponseSchema, if set, constrains the final answer to JSON matching it.
+	ResponseSchema json.RawMessage
+	// Cache asks the provider to cache the prompt prefix. Worth it when the same
+	// conversation comes back (agent turns); a one-off call would only pay the
+	// cache-write premium.
+	Cache bool
 }
 
 // Response is a provider-neutral completion result.
@@ -52,8 +58,9 @@ type Response struct {
 	ID           string     `json:"id"`
 	Content      string     `json:"content,omitempty"`
 	ToolCalls    []ToolCall `json:"tool_calls,omitempty"`
-	FinishReason string     `json:"finish_reason"` // OpenAI vocabulary: "stop", "length", "tool_calls"
-	InputTokens  int        `json:"input_tokens"`
+	FinishReason string     `json:"finish_reason"`           // OpenAI vocabulary: "stop", "length", "tool_calls"
+	InputTokens  int        `json:"input_tokens"`            // the whole prompt, cached or not
+	CachedTokens int        `json:"cached_tokens,omitempty"` // part of InputTokens read from the provider's cache
 	OutputTokens int        `json:"output_tokens"`
 }
 

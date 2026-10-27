@@ -62,9 +62,11 @@ func main() {
 	case "serve":
 		err = run(ctx, log, cfg, roles{api: true, worker: true, dispatcher: true})
 	case "api":
-		err = run(ctx, log, cfg, roles{api: true, dispatcher: true})
+		err = run(ctx, log, cfg, roles{api: true})
 	case "worker":
 		err = run(ctx, log, cfg, roles{worker: true})
+	case "webhooks":
+		err = run(ctx, log, cfg, roles{dispatcher: true})
 	case "migrate":
 		err = migrate(ctx, cfg)
 	case "demo-shop":
@@ -90,8 +92,9 @@ func usage() {
 
   dev         run everything in one process, in memory, with the demo shop
   serve       API + workers + webhooks (needs STEPWISE_DATABASE_URL)
-  api         API + webhooks only
+  api         API only
   worker      workers only
+  webhooks    webhook dispatcher only
   migrate     apply database migrations
   demo-shop   run the demo shop MCP server (STEPWISE_SHOP_ADDR, default :8090)
   healthcheck exit 0 if the local server answers /healthz (for containers)
@@ -142,20 +145,29 @@ func run(ctx context.Context, log *slog.Logger, cfg config.Config, r roles) erro
 	reg := metrics.NewRegistry()
 	router, mock := buildRouter(cfg)
 	runner := tools.NewRunner()
+	for _, h := range strings.Split(cfg.ToolHosts, ",") {
+		if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
+			runner.AllowedHosts = append(runner.AllowedHosts, h)
+		}
+	}
 	breakers := breaker.NewSet(5, 30*time.Second, nil)
 
+	rules, err := ratelimit.ParseRules(cfg.RateLimits)
+	if err != nil {
+		return fmt.Errorf("STEPWISE_RATE_LIMITS: %w", err)
+	}
 	var limiter ratelimit.Limiter = ratelimit.Unlimited{}
 	switch {
-	case len(cfg.RateLimits) > 0 && cfg.RedisURL != "":
-		rl, err := ratelimit.NewRedis(ctx, cfg.RedisURL, cfg.RateLimits)
+	case len(rules) > 0 && cfg.RedisURL != "":
+		rl, err := ratelimit.NewRedis(ctx, cfg.RedisURL, rules)
 		if err != nil {
 			return err
 		}
 		defer rl.Close()
 		limiter = rl
 		log.Info("rate limits shared across workers via redis")
-	case len(cfg.RateLimits) > 0:
-		limiter = ratelimit.NewLocal(cfg.RateLimits, nil)
+	case len(rules) > 0:
+		limiter = ratelimit.NewLocal(rules, nil)
 		if cfg.DatabaseURL != "" {
 			log.Warn("rate limits are per process; set STEPWISE_REDIS_URL to share them across worker processes")
 		}
@@ -164,7 +176,8 @@ func run(ctx context.Context, log *slog.Logger, cfg config.Config, r roles) erro
 	eng := engine.New(engine.Config{
 		Workers: cfg.Workers, Lease: cfg.Lease, MaxAttempts: cfg.MaxAttempts,
 		PollInterval: cfg.PollInterval, BackoffBase: cfg.BackoffBase, BackoffMax: cfg.BackoffMax,
-		Triage: engine.TriageConfig{Enabled: cfg.TriageEnabled, Model: cfg.TriageModel, AutoRetry: cfg.TriageAutoRetry},
+		Retention: time.Duration(cfg.RetentionDays) * 24 * time.Hour,
+		Triage:    engine.TriageConfig{Enabled: cfg.TriageEnabled, Model: cfg.TriageModel, AutoRetry: cfg.TriageAutoRetry},
 	}, engine.Deps{
 		Store: st, Router: router, Tools: runner, Limiter: limiter, Breakers: breakers,
 		Logger: log, Metrics: engine.NewMetrics(reg, breakers),
@@ -178,6 +191,9 @@ func run(ctx context.Context, log *slog.Logger, cfg config.Config, r roles) erro
 
 	if r.worker {
 		start("engine", func() { eng.Run(ctx) })
+	}
+	if r.api && !r.dispatcher {
+		log.Warn("this process does not deliver webhooks; run `stepwise webhooks` alongside it")
 	}
 	if r.dispatcher {
 		d := &webhook.Dispatcher{Store: st, Secret: []byte(cfg.WebhookSecret), Log: log}
@@ -206,7 +222,9 @@ func run(ctx context.Context, log *slog.Logger, cfg config.Config, r roles) erro
 			mux.Handle("/", (&api.Server{
 				Store: st, Tools: runner, Router: router, Token: cfg.APIToken,
 				Metrics: reg.Handler(), Gateway: gw.Handler(), Log: log, MaxBodyBytes: cfg.MaxBodyBytes,
-				Info: api.Info{Version: version, Mode: modeName(r), Models: router.Models(), DemoShopURL: shopURL},
+				MonthlyTokenLimit: cfg.MonthlyTokenLimit,
+				Kill:              killFunc(r, eng),
+				Info:              api.Info{Version: version, Mode: modeName(r), Models: router.Models(), DemoShopURL: shopURL},
 			}).Handler())
 		}
 		srv := &http.Server{Addr: cfg.Addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
@@ -233,7 +251,7 @@ func run(ctx context.Context, log *slog.Logger, cfg config.Config, r roles) erro
 	}
 	_ = mock
 
-	// Worker-only processes have no API server; give Prometheus and
+	// Worker and webhook processes have no API server; give Prometheus and
 	// container health checks something to talk to.
 	if !r.api && cfg.MetricsAddr != "" {
 		mux := http.NewServeMux()
@@ -254,6 +272,14 @@ func run(ctx context.Context, log *slog.Logger, cfg config.Config, r roles) erro
 	return nil
 }
 
+// killFunc lets the API simulate worker crashes, only when it shares a process with them.
+func killFunc(r roles, eng *engine.Engine) func(string) bool {
+	if !r.worker {
+		return nil
+	}
+	return eng.Kill
+}
+
 func modeName(r roles) string {
 	switch {
 	case r.dev:
@@ -262,8 +288,10 @@ func modeName(r roles) string {
 		return "serve"
 	case r.api:
 		return "api"
-	default:
+	case r.worker:
 		return "worker"
+	default:
+		return "webhooks"
 	}
 }
 

@@ -6,6 +6,8 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"sync"
 	"time"
 
 	"github.com/valayash/stepwise/internal/core"
@@ -25,6 +27,12 @@ type Store interface {
 	GetRun(ctx context.Context, id string) (core.Run, error)
 	ListRuns(ctx context.Context, f ListFilter) ([]core.Run, error)
 	ListSteps(ctx context.Context, runID string) ([]core.Step, error)
+	// CountActive counts unfinished runs whose metadata has the given key.
+	CountActive(ctx context.Context, metadataKey string) (int, error)
+	// Usage counts top-level runs created since a time, and tokens of model
+	// calls completed since then (sub-agents and later turns of older
+	// conversations included).
+	Usage(ctx context.Context, since time.Time) (Usage, error)
 
 	// ---- workers ----
 
@@ -53,7 +61,18 @@ type Store interface {
 	// ---- humans ----
 
 	DecideApproval(ctx context.Context, runID string, stepID int64, a core.Approval) error
+	// PendingApprovals lists every tool call waiting for a human on a run that
+	// isn't finished (a cancelled run's pending calls are moot), oldest first.
+	PendingApprovals(ctx context.Context) ([]core.Step, error)
+	// DeleteFinished deletes up to limit finished top-level runs that completed
+	// before a time, with their sub-agents, steps and deliveries. It returns
+	// how many runs were deleted, sub-agents included.
+	DeleteFinished(ctx context.Context, before time.Time, limit int) (int, error)
 	Cancel(ctx context.Context, runID string) error
+	// AddMessage continues a completed top-level run as a conversation: it
+	// saves the message as a user step and queues the run for the next reply.
+	// A repeated idempotencyKey returns the first message and changes nothing.
+	AddMessage(ctx context.Context, runID, content, idempotencyKey string) (core.Step, error)
 	// Retry puts a failed run back in the queue with a fresh retry counter.
 	Retry(ctx context.Context, runID string) error
 	SetTriage(ctx context.Context, runID string, diagnosis json.RawMessage) error
@@ -73,6 +92,12 @@ type Store interface {
 	Subscribe() (<-chan Event, func())
 
 	Close() error
+}
+
+// Usage is token spend over a period.
+type Usage struct {
+	Runs   int `json:"runs"`
+	Tokens int `json:"tokens"`
 }
 
 // ListFilter narrows ListRuns.
@@ -122,13 +147,95 @@ type Delivery struct {
 // Event types on the Subscribe channel.
 const (
 	EventRunsReady  = "runs_ready"  // something became claimable
-	EventRunChanged = "run_changed" // a run or its steps changed
+	EventRunChanged = "run_changed" // a run changed state (not sent for every step: live views poll)
+	EventDeliveries = "deliveries"  // a webhook was queued
 )
 
 // Event is a change notification.
 type Event struct {
 	Type  string `json:"type"`
 	RunID string `json:"run_id,omitempty"`
+}
+
+// Changed and Ready build the two kinds of Event.
+func Changed(runID string) Event { return Event{Type: EventRunChanged, RunID: runID} }
+func Ready(runID string) Event   { return Event{Type: EventRunsReady, RunID: runID} }
+
+// Deliveries announces a queued webhook.
+func Deliveries(runID string) Event { return Event{Type: EventDeliveries, RunID: runID} }
+
+// Hub fans events out to subscribers. Stores embed it to implement Subscribe.
+// The zero value is ready to use.
+type Hub struct {
+	mu   sync.Mutex
+	subs map[int]chan Event
+	next int
+}
+
+// Subscribe implements Store.
+func (h *Hub) Subscribe() (<-chan Event, func()) {
+	ch := make(chan Event, 64)
+	h.mu.Lock()
+	if h.subs == nil {
+		h.subs = map[int]chan Event{}
+	}
+	h.next++
+	id := h.next
+	h.subs[id] = ch
+	h.mu.Unlock()
+	var once sync.Once
+	return ch, func() {
+		once.Do(func() {
+			h.mu.Lock()
+			delete(h.subs, id)
+			h.mu.Unlock()
+		})
+	}
+}
+
+// Publish sends events to every subscriber, dropping them for slow ones:
+// subscribers also poll, so a missed event only delays them.
+func (h *Hub) Publish(events ...Event) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, e := range events {
+		for _, ch := range h.subs {
+			select {
+			case ch <- e:
+			default:
+			}
+		}
+	}
+}
+
+// FinishEvent is the webhook event sent when a run ends with status s.
+func FinishEvent(s core.RunStatus) string {
+	switch s {
+	case core.RunCompleted:
+		return core.EventRunCompleted
+	case core.RunFailed:
+		return core.EventRunFailed
+	case core.RunCancelled:
+		return core.EventRunCancelled
+	}
+	return ""
+}
+
+// RejectionResult is the tool result the model sees when a human rejects a call.
+func RejectionResult(note string) string {
+	msg := "The reviewer rejected this action."
+	if note != "" {
+		msg += " Reviewer note: " + note
+	}
+	return msg
+}
+
+// ChildResult is the parent step's result when its sub-agent run ends.
+func ChildResult(o Outcome) (result string, isError bool) {
+	if o.Status == core.RunCompleted {
+		return o.Output, false
+	}
+	return fmt.Sprintf("Sub-agent %s: %s", o.Status, o.Error), true
 }
 
 // WebhookPayload builds the JSON body sent for a run event. It is built at

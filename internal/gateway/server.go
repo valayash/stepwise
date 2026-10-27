@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/valayash/stepwise/internal/api"
 	"github.com/valayash/stepwise/internal/provider"
 )
 
@@ -74,7 +73,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, s.maxBodyBytes)
 
-	var req api.ChatCompletionRequest
+	var req ChatCompletionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
@@ -118,17 +117,17 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		"upstream_ms", s.now().Sub(start).Milliseconds(),
 	)
 
-	writeJSON(w, http.StatusOK, api.ChatCompletionResponse{
+	writeJSON(w, http.StatusOK, ChatCompletionResponse{
 		ID:      "chatcmpl-" + res.ID,
 		Object:  "chat.completion",
 		Created: s.now().Unix(),
 		Model:   req.Model,
-		Choices: []api.Choice{{
+		Choices: []Choice{{
 			Index:        0,
-			Message:      api.ChatMessage{Role: "assistant", Content: res.Content},
+			Message:      ChatMessage{Role: "assistant", Content: res.Content},
 			FinishReason: res.FinishReason,
 		}},
-		Usage: api.Usage{
+		Usage: Usage{
 			PromptTokens:     res.InputTokens,
 			CompletionTokens: res.OutputTokens,
 			TotalTokens:      res.InputTokens + res.OutputTokens,
@@ -155,7 +154,7 @@ func (s *Server) writeUpstreamError(w http.ResponseWriter, r *http.Request, name
 	}
 }
 
-func validate(req api.ChatCompletionRequest) string {
+func validate(req ChatCompletionRequest) string {
 	if req.Model == "" {
 		return "model is required"
 	}
@@ -175,7 +174,7 @@ func validate(req api.ChatCompletionRequest) string {
 	return ""
 }
 
-func toProviderRequest(req api.ChatCompletionRequest) provider.Request {
+func toProviderRequest(req ChatCompletionRequest) provider.Request {
 	out := provider.Request{Model: req.Model, Temperature: req.Temperature}
 	if req.MaxTokens != nil {
 		out.MaxTokens = *req.MaxTokens
@@ -194,7 +193,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func writeError(w http.ResponseWriter, status int, typ, code, msg string) {
-	writeJSON(w, status, api.ErrorResponse{Error: api.ErrorBody{Message: msg, Type: typ, Code: code}})
+	writeJSON(w, status, ErrorResponse{Error: ErrorBody{Message: msg, Type: typ, Code: code}})
 }
 
 // ---- middleware ----

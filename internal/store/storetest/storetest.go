@@ -34,6 +34,9 @@ func Run(t *testing.T, newStore Factory) {
 		"SubAgentResolvesParent":        testSubAgent,
 		"CancelCascadesAndFences":       testCancel,
 		"RetryFailedRun":                testRetry,
+		"MessageContinuesRun":           testConversation,
+		"CancelledRunHasNoApprovals":    testCancelledApprovals,
+		"CountActiveByMetadata":         testCountActive,
 		"WebhookOutbox":                 testOutbox,
 		"ConcurrentClaimsNeverOverlap":  testConcurrentClaims,
 		"ListRunsFilters":               testListRuns,
@@ -197,6 +200,12 @@ func testCompleteCountsTokens(t *testing.T, s store.Store) {
 	if got.TokensUsed != 42 {
 		t.Errorf("tokens double-counted: %d", got.TokensUsed)
 	}
+	if u, err := s.Usage(ctx, got.CreatedAt); err != nil || u.Runs != 1 || u.Tokens != 42 {
+		t.Errorf("usage = %+v %v", u, err)
+	}
+	if u, _ := s.Usage(ctx, got.CreatedAt.Add(time.Hour)); u.Runs != 0 {
+		t.Errorf("usage after the run = %+v", u)
+	}
 }
 
 func testYieldDelay(t *testing.T, s store.Store) {
@@ -242,9 +251,16 @@ func testApprovalFlow(t *testing.T, s store.Store) {
 	if len(ds) != 1 || ds[0].Event != core.EventApprovalRequested {
 		t.Errorf("approval webhook not queued: %+v", ds)
 	}
+	if p, err := s.PendingApprovals(ctx); err != nil || len(p) != 1 || p[0].ID != st.ID || p[0].RunID != r.ID {
+		t.Errorf("pending approvals = %+v %v", p, err)
+	}
 	if err := s.DecideApproval(ctx, r.ID, st.ID, core.Approval{Approved: true, DecidedBy: "ops"}); err != nil {
 		t.Fatal(err)
 	}
+	if p, _ := s.PendingApprovals(ctx); len(p) != 0 {
+		t.Errorf("decided call still pending: %+v", p)
+	}
+
 	if err := s.DecideApproval(ctx, r.ID, st.ID, core.Approval{Approved: true}); !errors.Is(err, core.ErrNotRunnable) {
 		t.Errorf("double decision: %v", err)
 	}
@@ -331,6 +347,28 @@ func testSubAgent(t *testing.T, s store.Store) {
 	kids, _ := s.ListRuns(ctx, store.ListFilter{ParentRunID: p.ID})
 	if len(kids) != 1 {
 		t.Errorf("children listed = %d", len(kids))
+	}
+
+	// Retention deletes a finished parent with its sub-agent, and nothing unfinished.
+	p = claimOne(t, s, "w1", time.Minute)
+	if err := s.Finish(ctx, fence(p), store.Outcome{Status: core.RunCompleted}); err != nil {
+		t.Fatal(err)
+	}
+	live := mustCreate(t, s, core.NewRun{Input: "still queued"})
+	if n, err := s.DeleteFinished(ctx, time.Now().Add(-time.Hour), 10); err != nil || n != 0 {
+		t.Errorf("deleting runs finished over an hour ago: %d %v", n, err)
+	}
+	if n, err := s.DeleteFinished(ctx, time.Now().Add(time.Hour), 10); err != nil || n != 2 {
+		t.Errorf("deleted %d runs, %v; want parent and child", n, err)
+	}
+	if _, err := s.GetRun(ctx, child.ID); !errors.Is(err, core.ErrNotFound) {
+		t.Errorf("child survived: %v", err)
+	}
+	if _, err := s.ListSteps(ctx, p.ID); !errors.Is(err, core.ErrNotFound) {
+		t.Errorf("parent steps survived: %v", err)
+	}
+	if _, err := s.GetRun(ctx, live.ID); err != nil {
+		t.Errorf("unfinished run deleted: %v", err)
 	}
 }
 
@@ -475,5 +513,61 @@ func testListRuns(t *testing.T, s store.Store) {
 	limited, _ := s.ListRuns(ctx, store.ListFilter{Limit: 2})
 	if len(all) != 3 || len(queued) != 2 || len(limited) != 2 {
 		t.Errorf("all=%d queued=%d limited=%d", len(all), len(queued), len(limited))
+	}
+}
+
+func testConversation(t *testing.T, s store.Store) {
+	mustCreate(t, s, core.NewRun{Input: "hi"})
+	r := claimOne(t, s, "w1", time.Minute)
+	if _, err := s.AddMessage(ctx, r.ID, "too early", ""); !errors.Is(err, core.ErrNotRunnable) {
+		t.Errorf("message to a running run: %v", err)
+	}
+	st, _ := s.BeginStep(ctx, fence(r), core.Step{Seq: 1, Kind: core.StepLLM})
+	st.Status, st.LLM = core.StepCompleted, &provider.Response{Content: "hello"}
+	_ = s.SaveStep(ctx, fence(r), st)
+	if err := s.Finish(ctx, fence(r), store.Outcome{Status: core.RunCompleted, Output: "hello"}); err != nil {
+		t.Fatal(err)
+	}
+
+	msg, err := s.AddMessage(ctx, r.ID, "and then?", "k1")
+	if err != nil || msg.Kind != core.StepUser || msg.Seq != 2 || msg.Result != "and then?" || msg.Status != core.StepCompleted {
+		t.Fatalf("AddMessage = %+v, %v", msg, err)
+	}
+	got, _ := s.GetRun(ctx, r.ID)
+	if got.Status != core.RunQueued || got.Output != "" || got.CompletedAt != nil {
+		t.Errorf("run after a message: status %s output %q completed %v", got.Status, got.Output, got.CompletedAt)
+	}
+	// The same key again (a client retry) returns the first message, even
+	// though the run is no longer completed, and adds nothing.
+	if rep, err := s.AddMessage(ctx, r.ID, "and then?", "k1"); err != nil || rep.ID != msg.ID {
+		t.Errorf("repeated key = %+v, %v; want the first message", rep, err)
+	}
+	if steps, _ := s.ListSteps(ctx, r.ID); len(steps) != 2 {
+		t.Errorf("steps after a repeated key = %d, want 2", len(steps))
+	}
+	if again := claimOne(t, s, "w2", time.Minute); again.ID != r.ID {
+		t.Errorf("claimed %s, want the reopened run", again.ID)
+	}
+	if _, err := s.AddMessage(ctx, "nope", "x", ""); !errors.Is(err, core.ErrNotFound) {
+		t.Errorf("message to a missing run: %v", err)
+	}
+}
+
+func testCountActive(t *testing.T, s store.Store) {
+	mustCreate(t, s, core.NewRun{Input: "a", Metadata: json.RawMessage(`{"triage_of":"x"}`)})
+	mustCreate(t, s, core.NewRun{Input: "b", Metadata: json.RawMessage(`{"ticket":"y"}`)})
+	mustCreate(t, s, core.NewRun{Input: "c"})
+	if n, err := s.CountActive(ctx, "triage_of"); err != nil || n != 1 {
+		t.Errorf("CountActive = %d, %v; want 1", n, err)
+	}
+}
+
+func testCancelledApprovals(t *testing.T, s store.Store) {
+	r, _ := pendingApproval(t, s)
+	if err := s.Cancel(ctx, r.ID); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := s.PendingApprovals(ctx); len(p) != 0 {
+		t.Errorf("a cancelled run's approval is still pending: %+v", p)
 	}
 }

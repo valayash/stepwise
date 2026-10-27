@@ -1,12 +1,9 @@
 package provider
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 )
@@ -76,6 +73,19 @@ type openAIRequest struct {
 	StreamOptions *struct {
 		IncludeUsage bool `json:"include_usage"`
 	} `json:"stream_options,omitempty"`
+	ResponseFormat *openAIResponseFormat `json:"response_format,omitempty"`
+}
+
+// openAIResponseFormat carries structured output: {"type": "json_schema", "json_schema": {...}}.
+type openAIResponseFormat struct {
+	Type       string           `json:"type"`
+	JSONSchema openAIJSONSchema `json:"json_schema"`
+}
+
+type openAIJSONSchema struct {
+	Name   string          `json:"name"`
+	Schema json.RawMessage `json:"schema"`
+	Strict bool            `json:"strict"`
 }
 
 type openAIUsage struct {
@@ -127,6 +137,10 @@ func (o *OpenAI) buildBody(req Request, stream bool) openAIRequest {
 		Temperature: req.Temperature,
 		Stream:      stream,
 	}
+	if len(req.ResponseSchema) > 0 {
+		body.ResponseFormat = &openAIResponseFormat{Type: "json_schema",
+			JSONSchema: openAIJSONSchema{Name: "response", Schema: req.ResponseSchema, Strict: true}}
+	}
 	for _, t := range req.Tools {
 		ot := openAITool{Type: "function"}
 		ot.Function.Name = t.Name
@@ -148,15 +162,9 @@ func (o *OpenAI) Complete(ctx context.Context, req Request) (Response, error) {
 	if err != nil {
 		return Response{}, err
 	}
-	defer resp.Body.Close()
-
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
-	if err != nil {
-		return Response{}, fmt.Errorf("read openai response: %w", err)
-	}
 	var or openAIResponse
-	if err := json.Unmarshal(raw, &or); err != nil {
-		return Response{}, fmt.Errorf("decode openai response: %w", err)
+	if err := decodeBody(resp, o.Name(), &or); err != nil {
+		return Response{}, err
 	}
 	if len(or.Choices) == 0 {
 		return Response{}, fmt.Errorf("openai response has no choices")
@@ -190,22 +198,13 @@ func (o *OpenAI) Stream(ctx context.Context, req Request, onDelta DeltaFunc) (Re
 	if err != nil {
 		return Response{}, err
 	}
-	defer resp.Body.Close()
-
 	var out Response
-	sc := bufio.NewScanner(resp.Body)
-	sc.Buffer(make([]byte, 0, 64<<10), maxSSELine)
-	for sc.Scan() {
-		data, ok := strings.CutPrefix(sc.Text(), "data:")
-		if !ok {
-			continue
-		}
-		data = strings.TrimSpace(data)
+	err = readSSE(ctx, resp, o.Name(), func(data string) (bool, error) {
 		if data == "[DONE]" {
 			if out.FinishReason == "" {
 				out.FinishReason = "stop"
 			}
-			return out, nil
+			return true, nil
 		}
 		var ev struct {
 			ID      string `json:"id"`
@@ -222,10 +221,10 @@ func (o *OpenAI) Stream(ctx context.Context, req Request, onDelta DeltaFunc) (Re
 			} `json:"error"`
 		}
 		if err := json.Unmarshal([]byte(data), &ev); err != nil {
-			return out, fmt.Errorf("decode openai stream event: %w", err)
+			return false, fmt.Errorf("decode openai stream event: %w", err)
 		}
 		if ev.Error != nil {
-			return out, &StreamError{Provider: o.Name(), Type: ev.Error.Type, Message: ev.Error.Message}
+			return false, &StreamError{Provider: o.Name(), Type: ev.Error.Type, Message: ev.Error.Message}
 		}
 		if out.ID == "" {
 			out.ID = ev.ID
@@ -233,7 +232,7 @@ func (o *OpenAI) Stream(ctx context.Context, req Request, onDelta DeltaFunc) (Re
 		for _, c := range ev.Choices {
 			if c.Delta.Content != "" {
 				if err := onDelta(c.Delta.Content); err != nil {
-					return out, err
+					return false, err
 				}
 			}
 			if c.FinishReason != nil {
@@ -244,41 +243,15 @@ func (o *OpenAI) Stream(ctx context.Context, req Request, onDelta DeltaFunc) (Re
 			out.InputTokens = ev.Usage.PromptTokens
 			out.OutputTokens = ev.Usage.CompletionTokens
 		}
-	}
-	if err := ctx.Err(); err != nil {
-		return out, err
-	}
-	if err := sc.Err(); err != nil {
-		return out, fmt.Errorf("read openai stream: %w", err)
-	}
-	return out, ErrIncompleteStream
+		return false, nil
+	})
+	return out, err
 }
 
 func (o *OpenAI) send(ctx context.Context, body openAIRequest) (*http.Response, error) {
-	buf, err := json.Marshal(body)
-	if err != nil {
-		return nil, fmt.Errorf("encode openai request: %w", err)
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, o.baseURL+"/v1/chat/completions", bytes.NewReader(buf))
-	if err != nil {
-		return nil, fmt.Errorf("build openai request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+o.apiKey)
-
-	resp, err := o.client.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("call openai: %w", err)
-	}
-	if resp.StatusCode/100 != 2 {
-		defer resp.Body.Close()
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-		return nil, &UpstreamError{
-			Provider: o.Name(), Status: resp.StatusCode, Body: truncate(string(raw), 512),
-			RetryAfter: resp.Header.Get("Retry-After"),
-		}
-	}
-	return resp, nil
+	header := http.Header{}
+	header.Set("Authorization", "Bearer "+o.apiKey)
+	return postJSON(ctx, o.client, o.Name(), o.baseURL+"/v1/chat/completions", header, body)
 }
 
 func mapOpenAIFinish(s string) string {

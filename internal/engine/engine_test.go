@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http/httptest"
@@ -191,6 +192,91 @@ func TestRejectedApprovalIsReportedToTheModel(t *testing.T) {
 // A worker issues the refund and dies before saving the result. The next
 // worker re-executes the step with the same idempotency key, and the shop
 // returns the original refund instead of paying twice.
+func TestUnansweredApprovalExpires(t *testing.T) {
+	h := newHarness(t)
+	h.start()
+	spec := shopSpec(h.shopMC, "issue_refund")
+	spec.ApprovalTimeout = "10ms"
+	run := h.create(spec, refundPrompt, 0)
+	done := h.waitStatus(run.ID, core.RunCompleted) // nobody decides; the sweep rejects it
+	if h.shop.Stats().RefundsIssued != 0 || !strings.Contains(done.Output, "rejected automatically") {
+		t.Errorf("refunds %d, output %q", h.shop.Stats().RefundsIssued, done.Output)
+	}
+}
+
+func TestRetentionDeletesFinishedRuns(t *testing.T) {
+	h := newHarness(t)
+	h.cfg.Retention = time.Millisecond
+	h.start()
+	run := h.create(core.AgentSpec{Model: "mock"}, "hi", 0)
+	h.waitStatus(run.ID, core.RunCompleted)
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		if _, err := h.store.GetRun(context.Background(), run.ID); errors.Is(err, core.ErrNotFound) {
+			return
+		}
+	}
+	t.Error("finished run was not deleted")
+}
+
+func TestConversationContinuesARun(t *testing.T) {
+	h := newHarness(t)
+	h.start()
+	run := h.create(core.AgentSpec{Model: "mock", MaxTurns: 1}, "hi", 0) // max_turns counts per message
+	if out := h.waitStatus(run.ID, core.RunCompleted).Output; out != "mock: hi" {
+		t.Fatalf("first reply = %q", out)
+	}
+	if _, err := h.store.AddMessage(context.Background(), run.ID, "and the second thing?", ""); err != nil {
+		t.Fatal(err)
+	}
+	if out := h.waitStatus(run.ID, core.RunCompleted).Output; out != "mock: and the second thing?" {
+		t.Errorf("second reply = %q", out)
+	}
+	var kinds []string
+	for _, s := range h.steps(run.ID) {
+		kinds = append(kinds, string(s.Kind))
+	}
+	if strings.Join(kinds, ",") != "llm,user,llm" {
+		t.Errorf("steps = %v", kinds)
+	}
+}
+
+func TestKillResumesFromSavedSteps(t *testing.T) {
+	h := newHarness(t)
+	h.mock.Latency = 150 * time.Millisecond // time to kill mid-call
+	h.start()
+	run := h.create(shopSpec(h.shopMC), refundPrompt, 0)
+	var killedSeq int
+	for deadline := time.Now().Add(5 * time.Second); killedSeq == 0 && time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		for _, s := range h.steps(run.ID) {
+			if s.Kind == core.StepLLM && s.Status == core.StepRunning && s.Seq > 1 && h.engine.Kill(run.ID) {
+				killedSeq = s.Seq // killed during a later model call, after earlier steps were saved
+			}
+		}
+	}
+	if killedSeq == 0 {
+		t.Fatal("never caught the run mid-step")
+	}
+	done := h.waitStatus(run.ID, core.RunCompleted)
+	if done.Claims < 2 || h.shop.Stats().RefundsIssued != 1 {
+		t.Errorf("claims %d, refunds %d; want a second claim and exactly one refund", done.Claims, h.shop.Stats().RefundsIssued)
+	}
+	for _, s := range h.steps(run.ID) {
+		if want := 1 + btoi(s.Seq == killedSeq); s.Attempts != want {
+			t.Errorf("step %d ran %d times, want %d (only the interrupted step runs again)", s.Seq, s.Attempts, want)
+		}
+	}
+	if h.engine.Kill(run.ID) {
+		t.Error("killing a finished run should report false")
+	}
+}
+
+func btoi(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 func TestCrashAfterSideEffectIsExactlyOnce(t *testing.T) {
 	h := newHarness(t)
 	spec, _ := h.runner.Prepare(context.Background(), core.AgentSpec{Model: "mock", Tools: []core.ToolSpec{{Type: core.ToolMCP, URL: h.shopMC, Include: []string{"issue_refund"}}}})
@@ -263,7 +349,7 @@ func TestTransientFailuresAreRetried(t *testing.T) {
 	}
 }
 
-func TestExhaustedRunIsTriagedAndRetriedAfterApproval(t *testing.T) {
+func TestOutageIsDiagnosedByRulesWithoutTriageRun(t *testing.T) {
 	fl := &flaky{Mock: provider.NewMock(), failFirst: 4} // MaxAttempts is 4
 	h := newHarness(t, provider.Route{Prefix: "flaky", Provider: fl})
 	h.cfg.Triage = TriageConfig{Enabled: true, Model: "mock"}
@@ -274,38 +360,50 @@ func TestExhaustedRunIsTriagedAndRetriedAfterApproval(t *testing.T) {
 	if failed.FailureKind != core.FailExhausted || !strings.Contains(failed.Error, "503") {
 		t.Fatalf("failed run = %+v", failed)
 	}
-
-	// The triage agent reads the failure, records a diagnosis, then asks to retry.
-	var triage core.Run
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) && triage.ID == "" {
-		runs, _ := h.store.ListRuns(context.Background(), store.ListFilter{Status: core.RunWaiting})
-		for _, r := range runs {
-			if triageOf(r) == run.ID {
-				triage = r
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if triage.ID == "" {
-		t.Fatal("no triage run waiting for approval")
-	}
-	got, _ := h.store.GetRun(context.Background(), run.ID)
 	var diag map[string]string
-	_ = json.Unmarshal(got.Triage, &diag)
-	if diag["category"] != "transient" || diag["triage_run_id"] != triage.ID {
+	for deadline := time.Now().Add(2 * time.Second); diag == nil && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		got, _ := h.store.GetRun(context.Background(), run.ID)
+		_ = json.Unmarshal(got.Triage, &diag)
+	}
+	if diag["category"] != "transient" || diag["triaged_by"] != "rules" {
 		t.Errorf("diagnosis = %v", diag)
 	}
-
-	for _, s := range h.steps(triage.ID) {
-		if s.Status == core.StepPendingApproval && s.ToolName == toolRetryRun {
-			_ = h.store.DecideApproval(context.Background(), triage.ID, s.ID, core.Approval{Approved: true})
+	runs, _ := h.store.ListRuns(context.Background(), store.ListFilter{})
+	for _, r := range runs {
+		if triageOf(r) != "" {
+			t.Errorf("an outage started an LLM triage run %s", r.ID)
 		}
 	}
-	h.waitStatus(triage.ID, core.RunCompleted)
-	retried := h.waitStatus(run.ID, core.RunCompleted) // the provider has recovered by now
-	if retried.Output != "mock: hello" {
-		t.Errorf("retried run output = %q", retried.Output)
+	_ = h.store.Retry(context.Background(), run.ID) // a person retries once the provider is back
+	if out := h.waitStatus(run.ID, core.RunCompleted).Output; out != "mock: hello" {
+		t.Errorf("retried run output = %q", out)
+	}
+}
+
+func TestTriageAgentRunsForOtherFailuresUpToTheCap(t *testing.T) {
+	h := newHarness(t)
+	h.cfg.Triage = TriageConfig{Enabled: true, Model: "mock", MaxActive: 1}
+	h.start()
+	diagnosis := func(id string) map[string]string {
+		var d map[string]string
+		for deadline := time.Now().Add(5 * time.Second); d == nil && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+			got, _ := h.store.GetRun(context.Background(), id)
+			_ = json.Unmarshal(got.Triage, &d)
+		}
+		return d
+	}
+	// A budget failure isn't an outage: the triage agent diagnoses it, then
+	// waits for approval to retry, so it stays active.
+	first := h.create(shopSpec(h.shopMC), refundPrompt, 1) // needs several model calls; budget runs out after the first
+	h.waitStatus(first.ID, core.RunFailed)
+	if d := diagnosis(first.ID); d["category"] != "budget" || d["triage_run_id"] == "" {
+		t.Fatalf("first diagnosis = %v, want one from a triage run", d)
+	}
+	// With one triage run already active, the next failure is diagnosed by the rules.
+	second := h.create(shopSpec(h.shopMC), refundPrompt, 1)
+	h.waitStatus(second.ID, core.RunFailed)
+	if d := diagnosis(second.ID); d["triaged_by"] != "rules" || !strings.Contains(d["summary"], "already active") {
+		t.Errorf("second diagnosis = %v, want rule-based because of the cap", d)
 	}
 }
 
@@ -427,8 +525,12 @@ func TestShutdownHandsRunsBack(t *testing.T) {
 	}
 }
 
-// inventor calls a tool that does not exist, then answers.
-type inventor struct{ calls atomic.Int32 }
+// inventor makes the first-turn tool calls (default: a tool that does not
+// exist), then answers with the last tool result.
+type inventor struct {
+	calls atomic.Int32
+	first []provider.ToolCall
+}
 
 func (i *inventor) Name() string { return "inventor" }
 func (i *inventor) Stream(context.Context, provider.Request, provider.DeltaFunc) (provider.Response, error) {
@@ -436,7 +538,10 @@ func (i *inventor) Stream(context.Context, provider.Request, provider.DeltaFunc)
 }
 func (i *inventor) Complete(_ context.Context, r provider.Request) (provider.Response, error) {
 	if i.calls.Add(1) == 1 {
-		return provider.Response{FinishReason: "tool_calls", ToolCalls: []provider.ToolCall{{ID: "x", Name: "launch_rockets", Input: json.RawMessage(`{}`)}}}, nil
+		if i.first == nil {
+			i.first = []provider.ToolCall{{ID: "x", Name: "launch_rockets", Input: json.RawMessage(`{}`)}}
+		}
+		return provider.Response{FinishReason: "tool_calls", ToolCalls: i.first}, nil
 	}
 	last := r.Messages[len(r.Messages)-1]
 	return provider.Response{FinishReason: "stop", Content: "recovered: " + last.Content}, nil
@@ -449,6 +554,47 @@ func TestModelInventsATool(t *testing.T) {
 	done := h.waitStatus(run.ID, core.RunCompleted)
 	if !strings.Contains(done.Output, "Unknown tool") || !strings.Contains(done.Output, "get_order") {
 		t.Errorf("output = %q", done.Output)
+	}
+}
+
+func TestToolCallLimit(t *testing.T) {
+	order := json.RawMessage(`{"order_id":"ORD-1001"}`)
+	h := newHarness(t, provider.Route{Prefix: "inventor", Provider: &inventor{first: []provider.ToolCall{
+		{ID: "a", Name: "get_order", Input: order}, {ID: "b", Name: "get_order", Input: order},
+	}}})
+	h.start()
+	run := h.create(core.AgentSpec{Model: "inventor", Limits: map[string]int{"get_order": 1},
+		Tools: []core.ToolSpec{{Type: core.ToolMCP, URL: h.shopMC, Include: []string{"get_order"}}}}, "x", 0)
+	done := h.waitStatus(run.ID, core.RunCompleted)
+	if !strings.Contains(done.Output, "at most 1 time") {
+		t.Errorf("output = %q", done.Output)
+	}
+	steps, _ := h.store.ListSteps(context.Background(), run.ID)
+	var made, refused int
+	for _, s := range steps {
+		if s.Kind == core.StepTool && s.IsError {
+			refused++
+		} else if s.Kind == core.StepTool {
+			made++
+		}
+	}
+	if made != 1 || refused != 1 {
+		t.Errorf("tool steps: made %d, refused %d; want 1 and 1", made, refused)
+	}
+}
+
+func TestResponseSchema(t *testing.T) {
+	h := newHarness(t, provider.Route{Prefix: "inventor", Provider: &inventor{}})
+	h.start()
+	schema := json.RawMessage(`{"type":"object","properties":{"order_id":{"type":"string"}}}`)
+	ok := h.create(core.AgentSpec{Model: "mock", ResponseSchema: schema}, "order_id: ORD-7", 0)
+	if out := h.waitStatus(ok.ID, core.RunCompleted).Output; out != `{"order_id":"ORD-7"}` {
+		t.Errorf("output = %q", out)
+	}
+	// inventor ignores the schema and answers in prose: callers must not get it as "JSON".
+	bad := h.create(core.AgentSpec{Model: "inventor", ResponseSchema: schema}, "x", 0)
+	if r := h.waitStatus(bad.ID, core.RunFailed); !strings.Contains(r.Error, "not valid JSON") {
+		t.Errorf("error = %q", r.Error)
 	}
 }
 

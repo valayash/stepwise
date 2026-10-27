@@ -24,7 +24,6 @@ import (
 	"io/fs"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/valayash/stepwise/internal/core"
@@ -45,12 +44,9 @@ type Listener interface {
 
 // Store is a Postgres-backed store.Store.
 type Store struct {
-	db *sql.DB
-
-	subMu sync.Mutex
-	subs  map[int]chan store.Event
-	subID int
-	stop  context.CancelFunc
+	store.Hub
+	db   *sql.DB
+	stop context.CancelFunc
 }
 
 var _ store.Store = (*Store)(nil)
@@ -58,7 +54,7 @@ var _ store.Store = (*Store)(nil)
 // New wraps db. If listener is non-nil, change notifications are fanned out
 // to Subscribe; otherwise subscribers rely on polling.
 func New(db *sql.DB, listener Listener) (*Store, error) {
-	s := &Store{db: db, subs: map[int]chan store.Event{}}
+	s := &Store{db: db}
 	if listener != nil {
 		ctx, cancel := context.WithCancel(context.Background())
 		s.stop = cancel
@@ -71,7 +67,7 @@ func New(db *sql.DB, listener Listener) (*Store, error) {
 			for payload := range ch {
 				var ev store.Event
 				if json.Unmarshal([]byte(payload), &ev) == nil {
-					s.publish(ev)
+					s.Publish(ev)
 				}
 			}
 		}()
@@ -157,6 +153,23 @@ func prefixed(cols, p string) string {
 }
 
 type scanner interface{ Scan(dest ...any) error }
+
+// scanAll reads every row of a query with scan.
+func scanAll[T any](rows *sql.Rows, err error, scan func(scanner) (T, error)) ([]T, error) {
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []T
+	for rows.Next() {
+		v, err := scan(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
 
 func scanRun(sc scanner) (core.Run, error) {
 	var (
@@ -301,9 +314,30 @@ func lockRun(ctx context.Context, tx *sql.Tx, id string) (core.Run, error) {
 	return scanRun(tx.QueryRowContext(ctx, `SELECT `+runCols+` FROM runs WHERE id = $1 FOR UPDATE`, id))
 }
 
-func notify(ctx context.Context, tx *sql.Tx, typ, runID string) error {
-	b, _ := json.Marshal(store.Event{Type: typ, RunID: runID})
-	_, err := tx.ExecContext(ctx, `SELECT pg_notify($1, $2)`, NotifyChannel, string(b))
+// notify sends events when (and only if) the transaction commits.
+// notify sends events when tx commits, in one round trip. Each notifying
+// commit takes a global lock (measured: -71% commits/s at 32 clients), so
+// notifications are kept to state changes that someone waits on.
+func notify(ctx context.Context, tx *sql.Tx, events ...store.Event) error {
+	calls := make([]string, len(events))
+	args := []any{NotifyChannel}
+	for i, e := range events {
+		b, _ := json.Marshal(e)
+		args = append(args, string(b))
+		calls[i] = fmt.Sprintf("pg_notify($1, $%d)", i+2)
+	}
+	_, err := tx.ExecContext(ctx, `SELECT `+strings.Join(calls, ", "), args...)
+	return err
+}
+
+// lockStep locks one of a run's steps.
+func lockStep(ctx context.Context, tx *sql.Tx, runID string, stepID int64) (core.Step, error) {
+	return scanStep(tx.QueryRowContext(ctx, `SELECT `+stepCols+` FROM steps WHERE id = $1 AND run_id = $2 FOR UPDATE`, stepID, runID))
+}
+
+// requeue makes a waiting run claimable now.
+func requeue(ctx context.Context, tx *sql.Tx, runID string) error {
+	_, err := tx.ExecContext(ctx, `UPDATE runs SET status = 'queued', available_at = now() WHERE id = $1`, runID)
 	return err
 }
 
@@ -322,19 +356,7 @@ func stepsOf(ctx context.Context, q interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }, runID string) ([]core.Step, error) {
 	rows, err := q.QueryContext(ctx, `SELECT `+stepCols+` FROM steps WHERE run_id = $1 ORDER BY seq`, runID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []core.Step
-	for rows.Next() {
-		st, err := scanStep(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, st)
-	}
-	return out, rows.Err()
+	return scanAll(rows, err, scanStep)
 }
 
 // outbox writes a webhook delivery in the caller's transaction.
@@ -347,9 +369,11 @@ func outbox(ctx context.Context, tx *sql.Tx, r core.Run, event string, step *cor
 		return err
 	}
 	payload := store.WebhookPayload(event, r, step, now)
-	_, err = tx.ExecContext(ctx, `INSERT INTO webhook_deliveries (run_id, url, event, payload) VALUES ($1, $2, $3, $4)`,
-		r.ID, r.WebhookURL, event, string(payload))
-	return err
+	if _, err = tx.ExecContext(ctx, `INSERT INTO webhook_deliveries (run_id, url, event, payload) VALUES ($1, $2, $3, $4)`,
+		r.ID, r.WebhookURL, event, string(payload)); err != nil {
+		return err
+	}
+	return notify(ctx, tx, store.Deliveries(r.ID))
 }
 
 // ---- runs ----
@@ -370,7 +394,7 @@ func (s *Store) CreateRun(ctx context.Context, nr core.NewRun) (core.Run, bool, 
 			return err
 		}
 		out, created = r, true
-		return notify(ctx, tx, store.EventRunsReady, r.ID)
+		return notify(ctx, tx, store.Ready(r.ID))
 	})
 	return out, created, err
 }
@@ -378,10 +402,6 @@ func (s *Store) CreateRun(ctx context.Context, nr core.NewRun) (core.Run, bool, 
 var errDuplicate = errors.New("duplicate idempotency key")
 
 func insertRun(ctx context.Context, tx *sql.Tx, nr core.NewRun) (core.Run, error) {
-	budget := nr.BudgetTokens
-	if budget <= 0 {
-		budget = core.DefaultBudgetTokens
-	}
 	spec, err := json.Marshal(nr.Spec.WithDefaults())
 	if err != nil {
 		return core.Run{}, err
@@ -396,7 +416,7 @@ func insertRun(ctx context.Context, tx *sql.Tx, nr core.NewRun) (core.Run, error
 		VALUES ($1, 'queued', $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (idempotency_key) DO NOTHING
 		RETURNING `+runCols,
-		core.NewID(), string(spec), nr.Input, budget, nullStr(nr.ParentRunID), parentStep,
+		core.NewID(), string(spec), nr.Input, nr.Budget(), nullStr(nr.ParentRunID), parentStep,
 		nr.WebhookURL, jsonArg(nr.Metadata), nullStr(nr.IdempotencyKey))
 	r, err := scanRun(row)
 	if errors.Is(err, core.ErrNotFound) {
@@ -434,19 +454,25 @@ func (s *Store) ListRuns(ctx context.Context, f store.ListFilter) ([]core.Run, e
 		q += fmt.Sprintf(" LIMIT $%d", len(args))
 	}
 	rows, err := s.db.QueryContext(ctx, q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []core.Run
-	for rows.Next() {
-		r, err := scanRun(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
+	return scanAll(rows, err, scanRun)
+}
+
+// CountActive implements store.Store.
+func (s *Store) CountActive(ctx context.Context, metadataKey string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM runs
+		WHERE status IN ('queued', 'running', 'waiting') AND metadata->>$1 IS NOT NULL`, metadataKey).Scan(&n)
+	return n, err
+}
+
+// Usage implements store.Store.
+func (s *Store) Usage(ctx context.Context, since time.Time) (store.Usage, error) {
+	var u store.Usage
+	err := s.db.QueryRowContext(ctx, `SELECT
+		(SELECT count(*) FROM runs WHERE parent_run_id IS NULL AND created_at >= $1),
+		(SELECT COALESCE(sum((llm->>'input_tokens')::bigint + (llm->>'output_tokens')::bigint), 0)
+		   FROM steps WHERE kind = 'llm' AND completed_at >= $1)`, since).Scan(&u.Runs, &u.Tokens)
+	return u, err
 }
 
 // ListSteps implements store.Store.
@@ -466,13 +492,17 @@ func (s *Store) ListSteps(ctx context.Context, runID string) ([]core.Step, error
 // ClaimRuns implements store.Store.
 func (s *Store) ClaimRuns(ctx context.Context, owner string, limit int, lease time.Duration) ([]core.Run, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		WITH claimable AS (
-			SELECT id FROM runs
-			WHERE (status = 'queued' AND available_at <= now())
-			   OR (status = 'running' AND lease_expires_at < now())
-			ORDER BY available_at
-			LIMIT $2
-			FOR UPDATE SKIP LOCKED
+		-- Two searches, each walking its own partial index, so a claim costs the
+		-- same with 20 or 20,000 queued runs (one OR'd search read and sorted
+		-- them all: ~9x fewer claims/s at 20k). Runs whose worker died go first.
+		WITH orphaned AS (
+			SELECT id FROM runs WHERE status = 'running' AND lease_expires_at < now()
+			ORDER BY lease_expires_at LIMIT $2 FOR UPDATE SKIP LOCKED
+		), ready AS (
+			SELECT id FROM runs WHERE status = 'queued' AND available_at <= now()
+			ORDER BY available_at LIMIT $2 FOR UPDATE SKIP LOCKED
+		), claimable AS (
+			SELECT id FROM orphaned UNION ALL SELECT id FROM ready LIMIT $2
 		)
 		UPDATE runs r
 		SET status = 'running', lease_owner = $1, claims = r.claims + 1,
@@ -480,19 +510,7 @@ func (s *Store) ClaimRuns(ctx context.Context, owner string, limit int, lease ti
 		FROM claimable c
 		WHERE r.id = c.id
 		RETURNING `+prefixed(runCols, "r"), owner, limit, secs(lease))
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []core.Run
-	for rows.Next() {
-		r, err := scanRun(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
+	return scanAll(rows, err, scanRun)
 }
 
 // Heartbeat implements store.Store.
@@ -557,10 +575,7 @@ func (s *Store) BeginStep(ctx context.Context, f core.Fence, st core.Step) (core
 		default:
 			return err
 		}
-		if err := touch(ctx, tx, f.RunID); err != nil {
-			return err
-		}
-		return notify(ctx, tx, store.EventRunChanged, f.RunID)
+		return nil // no run update or notification per step: one fewer write on runs, and live views poll
 	})
 	return out, err
 }
@@ -603,7 +618,7 @@ func (s *Store) SaveStep(ctx context.Context, f core.Fence, st core.Step) error 
 				return err
 			}
 		}
-		return notify(ctx, tx, store.EventRunChanged, f.RunID)
+		return nil
 	})
 }
 
@@ -617,7 +632,7 @@ func (s *Store) SpawnChild(ctx context.Context, f core.Fence, parent core.Step, 
 		if _, err := lockFenced(ctx, tx, f); err != nil {
 			return err
 		}
-		ps, err := scanStep(tx.QueryRowContext(ctx, `SELECT `+stepCols+` FROM steps WHERE id = $1 AND run_id = $2 FOR UPDATE`, parent.ID, f.RunID))
+		ps, err := lockStep(ctx, tx, f.RunID, parent.ID)
 		if err != nil {
 			return err
 		}
@@ -639,10 +654,7 @@ func (s *Store) SpawnChild(ctx context.Context, f core.Fence, parent core.Step, 
 		if err := touch(ctx, tx, f.RunID); err != nil {
 			return err
 		}
-		if err := notify(ctx, tx, store.EventRunsReady, child.ID); err != nil {
-			return err
-		}
-		return notify(ctx, tx, store.EventRunChanged, f.RunID)
+		return notify(ctx, tx, store.Ready(child.ID), store.Changed(f.RunID))
 	})
 	return outStep, child, err
 }
@@ -688,13 +700,13 @@ func (s *Store) Yield(ctx context.Context, f core.Fence, y store.Yield) error {
 			WHERE id = $1`, f.RunID, string(status), available, y.Attempts, y.Error); err != nil {
 			return err
 		}
-		if err := notify(ctx, tx, store.EventRunChanged, f.RunID); err != nil {
-			return err
+		switch {
+		case status == core.RunQueued && (available == nil || !y.AvailableAt.After(time.Now())):
+			return notify(ctx, tx, store.Ready(f.RunID))
+		case status == core.RunWaiting:
+			return notify(ctx, tx, store.Changed(f.RunID))
 		}
-		if status == core.RunQueued {
-			return notify(ctx, tx, store.EventRunsReady, f.RunID)
-		}
-		return nil
+		return nil // queued for later (backoff, rate limit): workers' polling finds it
 	})
 }
 
@@ -721,15 +733,10 @@ func finishTx(ctx context.Context, tx *sql.Tx, r core.Run, o store.Outcome) erro
 	if err != nil {
 		return err
 	}
-	event := map[core.RunStatus]string{
-		core.RunCompleted: core.EventRunCompleted,
-		core.RunFailed:    core.EventRunFailed,
-		core.RunCancelled: core.EventRunCancelled,
-	}[o.Status]
-	if err := outbox(ctx, tx, done, event, nil); err != nil {
+	if err := outbox(ctx, tx, done, store.FinishEvent(o.Status), nil); err != nil {
 		return err
 	}
-	if err := notify(ctx, tx, store.EventRunChanged, r.ID); err != nil {
+	if err := notify(ctx, tx, store.Changed(r.ID)); err != nil {
 		return err
 	}
 	if r.ParentRunID == "" {
@@ -741,10 +748,7 @@ func finishTx(ctx context.Context, tx *sql.Tx, r core.Run, o store.Outcome) erro
 	if err != nil {
 		return err
 	}
-	result, isErr := o.Output, false
-	if o.Status != core.RunCompleted {
-		result, isErr = fmt.Sprintf("Sub-agent %s: %s", o.Status, o.Error), true
-	}
+	result, isErr := store.ChildResult(o)
 	res, err := tx.ExecContext(ctx, `
 		UPDATE steps SET status = 'completed', result = $3, is_error = $4, completed_at = now(),
 		       duration_ms = (EXTRACT(EPOCH FROM now() - created_at) * 1000)::bigint
@@ -765,18 +769,44 @@ func finishTx(ctx context.Context, tx *sql.Tx, r core.Run, o store.Outcome) erro
 			return err
 		}
 		if !blocked {
-			if _, err := tx.ExecContext(ctx, `UPDATE runs SET status = 'queued', available_at = now() WHERE id = $1`, parent.ID); err != nil {
+			if err := requeue(ctx, tx, parent.ID); err != nil {
 				return err
 			}
-			if err := notify(ctx, tx, store.EventRunsReady, parent.ID); err != nil {
+			if err := notify(ctx, tx, store.Ready(parent.ID)); err != nil {
 				return err
 			}
 		}
 	}
-	return notify(ctx, tx, store.EventRunChanged, parent.ID)
+	return notify(ctx, tx, store.Changed(parent.ID))
 }
 
 // ---- humans ----
+
+// PendingApprovals implements store.Store.
+func (s *Store) PendingApprovals(ctx context.Context) ([]core.Step, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+prefixed(stepCols, "s")+` FROM steps s JOIN runs r ON r.id = s.run_id
+		WHERE s.status = 'pending_approval' AND r.status NOT IN ('completed', 'failed', 'cancelled') ORDER BY s.created_at`)
+	return scanAll(rows, err, scanStep)
+}
+
+// DeleteFinished implements store.Store. Steps and deliveries cascade;
+// sub-agents are deleted in the same statement as their parent, so the
+// parent_run_id reference holds when it is checked at the end.
+func (s *Store) DeleteFinished(ctx context.Context, before time.Time, limit int) (int, error) {
+	res, err := s.db.ExecContext(ctx, `
+		WITH RECURSIVE doomed AS (
+			(SELECT id FROM runs WHERE parent_run_id IS NULL AND completed_at < $1
+			   AND status IN ('completed', 'failed', 'cancelled') LIMIT $2)
+			UNION ALL
+			SELECT r.id FROM runs r JOIN doomed d ON r.parent_run_id = d.id
+		)
+		DELETE FROM runs WHERE id IN (SELECT id FROM doomed)`, before, limit)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
+}
 
 // DecideApproval implements store.Store.
 func (s *Store) DecideApproval(ctx context.Context, runID string, stepID int64, a core.Approval) error {
@@ -785,7 +815,7 @@ func (s *Store) DecideApproval(ctx context.Context, runID string, stepID int64, 
 		if err != nil {
 			return err
 		}
-		st, err := scanStep(tx.QueryRowContext(ctx, `SELECT `+stepCols+` FROM steps WHERE id = $1 AND run_id = $2 FOR UPDATE`, stepID, runID))
+		st, err := lockStep(ctx, tx, runID, stepID)
 		if err != nil {
 			return err
 		}
@@ -798,12 +828,8 @@ func (s *Store) DecideApproval(ctx context.Context, runID string, stepID int64, 
 		if a.Approved {
 			_, err = tx.ExecContext(ctx, `UPDATE steps SET status = 'approved', approval = $2 WHERE id = $1`, stepID, jsonOf(a))
 		} else {
-			msg := "The reviewer rejected this action."
-			if a.Note != "" {
-				msg += " Reviewer note: " + a.Note
-			}
 			_, err = tx.ExecContext(ctx, `UPDATE steps SET status = 'completed', approval = $2, is_error = true, result = $3, completed_at = now() WHERE id = $1`,
-				stepID, jsonOf(a), msg)
+				stepID, jsonOf(a), store.RejectionResult(a.Note))
 		}
 		if err != nil {
 			return err
@@ -814,7 +840,7 @@ func (s *Store) DecideApproval(ctx context.Context, runID string, stepID int64, 
 				return err
 			}
 			if work || !blocked {
-				if _, err := tx.ExecContext(ctx, `UPDATE runs SET status = 'queued', available_at = now() WHERE id = $1`, runID); err != nil {
+				if err := requeue(ctx, tx, runID); err != nil {
 					return err
 				}
 			}
@@ -822,10 +848,7 @@ func (s *Store) DecideApproval(ctx context.Context, runID string, stepID int64, 
 		if err := touch(ctx, tx, runID); err != nil {
 			return err
 		}
-		if err := notify(ctx, tx, store.EventRunChanged, runID); err != nil {
-			return err
-		}
-		return notify(ctx, tx, store.EventRunsReady, runID)
+		return notify(ctx, tx, store.Changed(runID), store.Ready(runID))
 	})
 }
 
@@ -890,17 +913,48 @@ func (s *Store) Retry(ctx context.Context, runID string) error {
 		if r.Status != core.RunFailed {
 			return fmt.Errorf("%w: only failed runs can be retried (run is %s)", core.ErrNotRunnable, r.Status)
 		}
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE runs SET status = 'queued', available_at = now(), attempts = 0, error = '',
-			       failure_kind = '', completed_at = NULL, updated_at = now()
-			WHERE id = $1`, runID); err != nil {
-			return err
-		}
-		if err := notify(ctx, tx, store.EventRunChanged, runID); err != nil {
-			return err
-		}
-		return notify(ctx, tx, store.EventRunsReady, runID)
+		return reopen(ctx, tx, runID)
 	})
+}
+
+// AddMessage implements store.Store.
+func (s *Store) AddMessage(ctx context.Context, runID, content, idempotencyKey string) (core.Step, error) {
+	var out core.Step
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
+		r, err := lockRun(ctx, tx, runID)
+		if err != nil {
+			return err
+		}
+		if idempotencyKey != "" { // the key lives in tool_call_id, unused for user steps
+			out, err = scanStep(tx.QueryRowContext(ctx, `SELECT `+stepCols+` FROM steps
+				WHERE run_id = $1 AND kind = 'user' AND tool_call_id = $2`, runID, idempotencyKey))
+			if !errors.Is(err, core.ErrNotFound) {
+				return err // found (a repeat): nil; or a real error
+			}
+		}
+		if r.Status != core.RunCompleted || r.ParentRunID != "" {
+			return fmt.Errorf("%w: messages continue completed top-level runs (run is %s)", core.ErrNotRunnable, r.Status)
+		}
+		if out, err = scanStep(tx.QueryRowContext(ctx, `
+			INSERT INTO steps (run_id, seq, kind, status, result, tool_call_id, completed_at)
+			SELECT $1, COALESCE(max(seq), 0) + 1, 'user', 'completed', $2, $3, now() FROM steps WHERE run_id = $1
+			RETURNING `+stepCols, runID, content, idempotencyKey)); err != nil {
+			return err
+		}
+		return reopen(ctx, tx, runID)
+	})
+	return out, err
+}
+
+// reopen puts a finished run back in the queue (retry, or the next turn of a conversation).
+func reopen(ctx context.Context, tx *sql.Tx, runID string) error {
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE runs SET status = 'queued', available_at = now(), attempts = 0, output = '', error = '',
+		       failure_kind = '', completed_at = NULL, updated_at = now()
+		WHERE id = $1`, runID); err != nil {
+		return err
+	}
+	return notify(ctx, tx, store.Changed(runID), store.Ready(runID))
 }
 
 // SetTriage implements store.Store.
@@ -914,7 +968,7 @@ func (s *Store) SetTriage(ctx context.Context, runID string, d json.RawMessage) 
 		if err := outbox(ctx, tx, r, core.EventRunTriaged, nil); err != nil {
 			return err
 		}
-		return notify(ctx, tx, store.EventRunChanged, runID)
+		return notify(ctx, tx, store.Changed(runID))
 	})
 }
 
@@ -945,19 +999,7 @@ func (s *Store) ClaimDeliveries(ctx context.Context, limit int, lease time.Durat
 		SET attempts = d.attempts + 1, leased_until = now() + make_interval(secs => $2)
 		FROM due WHERE d.id = due.id
 		RETURNING `+prefixed(deliveryCols, "d"), limit, secs(lease))
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []store.Delivery
-	for rows.Next() {
-		d, err := scanDelivery(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, d)
-	}
-	return out, rows.Err()
+	return scanAll(rows, err, scanDelivery)
 }
 
 // CompleteDelivery implements store.Store.
@@ -982,19 +1024,7 @@ func (s *Store) ListDeliveries(ctx context.Context, runID string) ([]store.Deliv
 		q, args = `SELECT `+deliveryCols+` FROM webhook_deliveries WHERE run_id = $1 ORDER BY id`, []any{runID}
 	}
 	rows, err := s.db.QueryContext(ctx, q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []store.Delivery
-	for rows.Next() {
-		d, err := scanDelivery(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, d)
-	}
-	return out, rows.Err()
+	return scanAll(rows, err, scanDelivery)
 }
 
 func (s *Store) execOne(ctx context.Context, q string, args ...any) error {
@@ -1006,35 +1036,4 @@ func (s *Store) execOne(ctx context.Context, q string, args ...any) error {
 		return core.ErrNotFound
 	}
 	return nil
-}
-
-// ---- notifications ----
-
-// Subscribe implements store.Store.
-func (s *Store) Subscribe() (<-chan store.Event, func()) {
-	ch := make(chan store.Event, 64)
-	s.subMu.Lock()
-	s.subID++
-	id := s.subID
-	s.subs[id] = ch
-	s.subMu.Unlock()
-	var once sync.Once
-	return ch, func() {
-		once.Do(func() {
-			s.subMu.Lock()
-			delete(s.subs, id)
-			s.subMu.Unlock()
-		})
-	}
-}
-
-func (s *Store) publish(e store.Event) {
-	s.subMu.Lock()
-	defer s.subMu.Unlock()
-	for _, ch := range s.subs {
-		select {
-		case ch <- e:
-		default:
-		}
-	}
 }

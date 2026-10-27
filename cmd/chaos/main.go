@@ -62,6 +62,12 @@ func main() {
 		bin        = flag.String("bin", "", "stepwise binary for -db mode (built automatically if empty)")
 	)
 	flag.Parse()
+	if *db != "" && *latency <= 0 {
+		// Worker processes read it as STEPWISE_MOCK_LATENCY, which must be positive;
+		// with 0 they exit at startup and the run would just time out.
+		fmt.Fprintln(os.Stderr, "chaos: -latency must be positive with -db (use 1ms for none)")
+		os.Exit(2)
+	}
 
 	rep, err := run(config{*runs, *workers, *perWorker, *killEvery, *lease, *toolFaults, *llmFaults, *latency, *timeout, *db, *bin})
 	if err != nil {

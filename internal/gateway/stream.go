@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/valayash/stepwise/internal/api"
 	"github.com/valayash/stepwise/internal/provider"
 )
 
@@ -53,7 +52,7 @@ func (s *sseWriter) done() error {
 	return s.rc.Flush()
 }
 
-func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, p provider.Provider, req api.ChatCompletionRequest) {
+func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, p provider.Provider, req ChatCompletionRequest) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.streamTimeout)
 	defer cancel()
 
@@ -61,16 +60,16 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, p provider
 	id := "chatcmpl-" + newID()
 	created := s.now().Unix()
 
-	chunk := func(delta api.ChunkDelta, finish *string) api.ChatCompletionChunk {
-		return api.ChatCompletionChunk{
+	chunk := func(delta ChunkDelta, finish *string) ChatCompletionChunk {
+		return ChatCompletionChunk{
 			ID: id, Object: "chat.completion.chunk", Created: created, Model: req.Model,
-			Choices: []api.ChunkChoice{{Index: 0, Delta: delta, FinishReason: finish}},
+			Choices: []ChunkChoice{{Index: 0, Delta: delta, FinishReason: finish}},
 		}
 	}
 	// The first chunk announces the assistant role, as OpenAI does.
 	begin := func() error {
 		sw.start()
-		return sw.send(chunk(api.ChunkDelta{Role: "assistant"}, nil))
+		return sw.send(chunk(ChunkDelta{Role: "assistant"}, nil))
 	}
 
 	start := s.now()
@@ -80,7 +79,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, p provider
 				return err
 			}
 		}
-		return sw.send(chunk(api.ChunkDelta{Content: text}, nil))
+		return sw.send(chunk(ChunkDelta{Content: text}, nil))
 	})
 
 	if err != nil {
@@ -95,7 +94,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, p provider
 		}
 		// Mid-stream failure: send an OpenAI-style error event and end without [DONE],
 		// so clients can tell the answer is incomplete.
-		_ = sw.send(api.ErrorResponse{Error: api.ErrorBody{
+		_ = sw.send(ErrorResponse{Error: ErrorBody{
 			Message: streamErrorMessage(err), Type: "upstream_error", Code: "stream_interrupted",
 		}})
 		return
@@ -110,17 +109,17 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request, p provider
 	if finish == "" {
 		finish = "stop"
 	}
-	_ = sw.send(chunk(api.ChunkDelta{}, &finish))
+	_ = sw.send(chunk(ChunkDelta{}, &finish))
 
-	usage := api.Usage{
+	usage := Usage{
 		PromptTokens:     res.InputTokens,
 		CompletionTokens: res.OutputTokens,
 		TotalTokens:      res.InputTokens + res.OutputTokens,
 	}
 	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
-		_ = sw.send(api.ChatCompletionChunk{
+		_ = sw.send(ChatCompletionChunk{
 			ID: id, Object: "chat.completion.chunk", Created: created, Model: req.Model,
-			Choices: []api.ChunkChoice{}, Usage: &usage,
+			Choices: []ChunkChoice{}, Usage: &usage,
 		})
 	}
 	_ = sw.done()

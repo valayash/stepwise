@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/valayash/stepwise/internal/provider"
@@ -54,6 +55,7 @@ type StepKind string
 const (
 	StepLLM  StepKind = "llm"
 	StepTool StepKind = "tool"
+	StepUser StepKind = "user" // a follow-up message in a conversation; the text is in Result
 )
 
 // StepStatus is where a step is.
@@ -90,18 +92,31 @@ type ToolSpec struct {
 	URL         string          `json:"url,omitempty"`
 	Include     []string        `json:"include,omitempty"` // MCP server reference filter
 	Agent       *AgentSpec      `json:"agent,omitempty"`   // sub-agent definition
-	TimeoutSecs int             `json:"timeout_seconds,omitempty"`
+	// Headers are sent with every HTTP or MCP request for this tool. Values may
+	// reference ${STEPWISE_SECRET_*} variables, resolved at call time so secrets
+	// are never stored with the run.
+	Headers     map[string]string `json:"headers,omitempty"`
+	TimeoutSecs int               `json:"timeout_seconds,omitempty"`
 }
 
 // AgentSpec defines an agent: model, instructions, tools and limits.
 type AgentSpec struct {
-	Model            string     `json:"model"`
-	System           string     `json:"system,omitempty"`
-	Tools            []ToolSpec `json:"tools,omitempty"`
-	RequireApproval  []string   `json:"require_approval,omitempty"` // tool names that need a human OK
-	MaxTurns         int        `json:"max_turns,omitempty"`        // LLM calls per run, default 20
-	MaxTokensPerCall int        `json:"max_tokens_per_call,omitempty"`
-	Temperature      *float64   `json:"temperature,omitempty"`
+	Model           string     `json:"model"`
+	System          string     `json:"system,omitempty"`
+	Tools           []ToolSpec `json:"tools,omitempty"`
+	RequireApproval []string   `json:"require_approval,omitempty"` // tool names that need a human OK
+	// Limits caps how many times a tool may be called per run, e.g. {"issue_refund": 1}.
+	// Extra calls are returned to the model as errors.
+	Limits map[string]int `json:"limits,omitempty"`
+	// ApprovalTimeout (e.g. "24h") rejects a tool call nobody approved in time;
+	// the model is told and can finish without it. Empty waits forever.
+	ApprovalTimeout string `json:"approval_timeout,omitempty"`
+	// ResponseSchema (a JSON Schema object) makes the final answer JSON that
+	// matches it, using the provider's structured-output mode.
+	ResponseSchema   json.RawMessage `json:"response_schema,omitempty"`
+	MaxTurns         int             `json:"max_turns,omitempty"` // LLM calls per run, default 20
+	MaxTokensPerCall int             `json:"max_tokens_per_call,omitempty"`
+	Temperature      *float64        `json:"temperature,omitempty"`
 }
 
 // Defaults applied when a spec leaves a limit unset.
@@ -140,6 +155,12 @@ func (a AgentSpec) NeedsApproval(name string) bool {
 		}
 	}
 	return false
+}
+
+// ApprovalTTL is ApprovalTimeout as a duration (0 = wait forever).
+func (a AgentSpec) ApprovalTTL() time.Duration {
+	d, _ := time.ParseDuration(a.ApprovalTimeout)
+	return d
 }
 
 // ToolDefs converts the spec's tools into the provider-neutral definitions sent to the model.
@@ -224,7 +245,7 @@ func (s Step) IdempotencyKey() string {
 	if s.ToolCallID != "" {
 		return s.RunID + ":" + s.ToolCallID
 	}
-	return s.RunID + ":step:" + itoa(s.Seq)
+	return s.RunID + ":step:" + strconv.Itoa(s.Seq)
 }
 
 // Tokens is the step's LLM token usage.
@@ -245,6 +266,14 @@ type NewRun struct {
 	IdempotencyKey string          `json:"idempotency_key,omitempty"`
 	ParentRunID    string          `json:"-"`
 	ParentStepID   int64           `json:"-"`
+}
+
+// Budget is the run's token budget, or the default when none was set.
+func (nr NewRun) Budget() int {
+	if nr.BudgetTokens > 0 {
+		return nr.BudgetTokens
+	}
+	return DefaultBudgetTokens
 }
 
 // Fence identifies a worker's claim on a run. Every write a worker makes
@@ -273,6 +302,7 @@ var (
 	ErrConflict    = errors.New("conflict")
 	ErrInvalid     = errors.New("invalid request")
 	ErrNotRunnable = errors.New("run is not in a state that allows this")
+	ErrLimit       = errors.New("limit reached")
 )
 
 // NewID returns a random 128-bit hex ID.
@@ -280,26 +310,4 @@ func NewID() string {
 	var b [16]byte
 	_, _ = rand.Read(b[:])
 	return hex.EncodeToString(b[:])
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var buf [20]byte
-	i := len(buf)
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
 }

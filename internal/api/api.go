@@ -3,6 +3,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"embed"
@@ -14,6 +15,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/valayash/stepwise/internal/core"
@@ -38,6 +40,19 @@ type Server struct {
 	MaxBodyBytes int64
 	// Info is served at GET /v1/info.
 	Info Info
+	// MonthlyTokenLimit, if set, refuses new runs once this month's usage reaches it.
+	MonthlyTokenLimit int
+	// Kill, if set, simulates a crash of the worker executing a run (only possible
+	// when the API and workers share a process: dev and serve).
+	Kill func(runID string) bool
+
+	// UsageCacheTTL is how long usage is reused (default 10s): the spend check
+	// runs on every create, and the limit can be overshot by that window's spend.
+	UsageCacheTTL time.Duration
+
+	usageMu    sync.Mutex
+	usageCache usageView
+	usageAt    time.Time
 }
 
 // Info describes this deployment to clients and the UI.
@@ -66,15 +81,18 @@ func (s *Server) Handler() http.Handler {
 
 	v1 := http.NewServeMux()
 	v1.HandleFunc("POST /v1/runs", s.createRun)
-	v1.HandleFunc("GET /v1/runs", s.listRuns)
-	v1.HandleFunc("GET /v1/runs/{id}", s.getRun)
+	v1.HandleFunc("GET /v1/runs", s.serveJSON(s.listRuns))
+	v1.HandleFunc("GET /v1/runs/{id}", s.serveJSON(s.getRun))
 	v1.HandleFunc("GET /v1/runs/{id}/events", s.events)
-	v1.HandleFunc("GET /v1/runs/{id}/deliveries", s.deliveries)
-	v1.HandleFunc("POST /v1/runs/{id}/cancel", s.cancel)
-	v1.HandleFunc("POST /v1/runs/{id}/retry", s.retry)
-	v1.HandleFunc("POST /v1/runs/{id}/steps/{step}/approve", s.decide(true))
-	v1.HandleFunc("POST /v1/runs/{id}/steps/{step}/reject", s.decide(false))
-	v1.HandleFunc("GET /v1/approvals", s.approvals)
+	v1.HandleFunc("GET /v1/runs/{id}/deliveries", s.serveJSON(s.deliveries))
+	v1.HandleFunc("POST /v1/runs/{id}/cancel", s.serveJSON(s.mutate(s.Store.Cancel)))
+	v1.HandleFunc("POST /v1/runs/{id}/retry", s.serveJSON(s.mutate(s.Store.Retry)))
+	v1.HandleFunc("POST /v1/runs/{id}/messages", s.serveJSON(s.addMessage))
+	v1.HandleFunc("POST /v1/runs/{id}/kill", s.serveJSON(s.kill))
+	v1.HandleFunc("POST /v1/runs/{id}/steps/{step}/approve", s.serveJSON(s.decide(true)))
+	v1.HandleFunc("POST /v1/runs/{id}/steps/{step}/reject", s.serveJSON(s.decide(false)))
+	v1.HandleFunc("GET /v1/approvals", s.serveJSON(s.approvals))
+	v1.HandleFunc("GET /v1/usage", s.serveJSON(s.usage))
 	v1.HandleFunc("GET /v1/info", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, s.Info) })
 	if s.Gateway != nil {
 		v1.Handle("POST /v1/chat/completions", s.Gateway)
@@ -113,6 +131,10 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
+	if err := s.checkSpend(ctx); err != nil {
+		writeErr(w, err)
+		return
+	}
 	spec, err := s.Tools.Prepare(ctx, *req.Agent)
 	if err != nil {
 		writeErr(w, err)
@@ -144,6 +166,10 @@ func (s *Server) checkModels(spec core.AgentSpec) error {
 	if _, err := s.Router.For(spec.Model); err != nil {
 		return fmt.Errorf("%w: %v (configured: %s)", core.ErrInvalid, err, strings.Join(s.Router.Models(), ", "))
 	}
+	if spec.Temperature != nil && strings.HasPrefix(spec.Model, "claude-") {
+		// Current Claude models reject sampling parameters; fail now, not at the first model call.
+		return fmt.Errorf("%w: %s does not accept temperature; remove it", core.ErrInvalid, spec.Model)
+	}
 	for _, t := range spec.Tools {
 		if t.Agent != nil {
 			if err := s.checkModels(*t.Agent); err != nil {
@@ -154,7 +180,69 @@ func (s *Server) checkModels(spec core.AgentSpec) error {
 	return nil
 }
 
-func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
+// handlerFunc is a handler whose result is sent as JSON with status 200.
+// It returns errWritten when it already wrote the response itself.
+type handlerFunc func(w http.ResponseWriter, r *http.Request) (any, error)
+
+var errWritten = errors.New("response already written")
+
+// serveJSON adapts a handlerFunc: the result becomes the body, an error becomes
+// the matching status code.
+func (s *Server) serveJSON(fn handlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		v, err := fn(w, r)
+		switch {
+		case errors.Is(err, errWritten):
+		case err != nil:
+			writeErr(w, err)
+		default:
+			writeJSON(w, 200, v)
+		}
+	}
+}
+
+type usageView struct {
+	store.Usage
+	Since time.Time `json:"since"`
+	Limit int       `json:"monthly_token_limit,omitempty"`
+}
+
+// monthUsage is this calendar month's spend (UTC), cached for UsageCacheTTL.
+func (s *Server) monthUsage(ctx context.Context) (usageView, error) {
+	now := time.Now().UTC()
+	v := usageView{Since: time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC), Limit: s.MonthlyTokenLimit}
+	s.usageMu.Lock()
+	defer s.usageMu.Unlock()
+	ttl := s.UsageCacheTTL
+	if ttl <= 0 {
+		ttl = 10 * time.Second
+	}
+	if now.Sub(s.usageAt) < ttl && s.usageCache.Since.Equal(v.Since) {
+		return s.usageCache, nil
+	}
+	var err error
+	if v.Usage, err = s.Store.Usage(ctx, v.Since); err == nil {
+		s.usageCache, s.usageAt = v, now
+	}
+	return v, err
+}
+
+func (s *Server) usage(_ http.ResponseWriter, r *http.Request) (any, error) {
+	return s.monthUsage(r.Context())
+}
+
+func (s *Server) checkSpend(ctx context.Context) error {
+	if s.MonthlyTokenLimit <= 0 {
+		return nil
+	}
+	u, err := s.monthUsage(ctx)
+	if err == nil && u.Tokens >= u.Limit {
+		err = fmt.Errorf("%w: monthly token limit of %d reached (%d used)", core.ErrLimit, u.Limit, u.Tokens)
+	}
+	return err
+}
+
+func (s *Server) listRuns(_ http.ResponseWriter, r *http.Request) (any, error) {
 	q := r.URL.Query()
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	if limit <= 0 || limit > 500 {
@@ -163,14 +251,10 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 	runs, err := s.Store.ListRuns(r.Context(), store.ListFilter{
 		Status: core.RunStatus(q.Get("status")), ParentRunID: q.Get("parent_run_id"), Limit: limit,
 	})
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
 	if runs == nil {
 		runs = []core.Run{}
 	}
-	writeJSON(w, 200, map[string]any{"runs": runs})
+	return map[string]any{"runs": runs}, err
 }
 
 type runView struct {
@@ -198,13 +282,8 @@ func (s *Server) view(ctx context.Context, id string) (runView, error) {
 	return runView{Run: run, Steps: steps, Children: kids}, nil
 }
 
-func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
-	v, err := s.view(r.Context(), r.PathValue("id"))
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	writeJSON(w, 200, v)
+func (s *Server) getRun(_ http.ResponseWriter, r *http.Request) (any, error) {
+	return s.view(r.Context(), r.PathValue("id"))
 }
 
 // events streams the run as server-sent events: a full snapshot now, then a
@@ -223,8 +302,13 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
 	rc := http.NewResponseController(w)
+	var last []byte
 	send := func(v runView) bool {
 		b, _ := json.Marshal(v)
+		if bytes.Equal(b, last) {
+			return true // nothing changed since the last snapshot
+		}
+		last = b
 		if _, err := fmt.Fprintf(w, "event: run\ndata: %s\n\n", b); err != nil {
 			return false
 		}
@@ -234,11 +318,12 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Stores notify on run state changes, not on every step, so the view also
+	// polls; the run's own events just make state changes show up sooner.
 	keepalive := time.NewTicker(15 * time.Second)
 	defer keepalive.Stop()
-	poll := time.NewTicker(2 * time.Second) // events are best-effort; poll as a backstop
+	poll := time.NewTicker(time.Second)
 	defer poll.Stop()
-	last := v.UpdatedAt
 	for {
 		select {
 		case <-r.Context().Done():
@@ -249,98 +334,93 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		case ev := <-ch:
-			if ev.RunID != id && !s.isChild(r.Context(), ev.RunID, id) {
+			if ev.RunID != id {
 				continue
 			}
 		case <-poll.C:
 		}
 		v, err := s.view(r.Context(), id)
-		if err != nil {
-			return
-		}
-		if v.UpdatedAt.Equal(last) && len(v.Children) == 0 {
-			continue
-		}
-		last = v.UpdatedAt
-		if !send(v) || v.Status.Terminal() {
+		if err != nil || !send(v) || v.Status.Terminal() {
 			return
 		}
 	}
 }
 
-func (s *Server) isChild(ctx context.Context, childID, parentID string) bool {
-	if childID == "" {
-		return false
-	}
-	r, err := s.Store.GetRun(ctx, childID)
-	return err == nil && r.ParentRunID == parentID
-}
-
-func (s *Server) deliveries(w http.ResponseWriter, r *http.Request) {
+func (s *Server) deliveries(_ http.ResponseWriter, r *http.Request) (any, error) {
 	id := r.PathValue("id")
 	if _, err := s.Store.GetRun(r.Context(), id); err != nil {
-		writeErr(w, err)
-		return
+		return nil, err
 	}
 	ds, err := s.Store.ListDeliveries(r.Context(), id)
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
 	if ds == nil {
 		ds = []store.Delivery{}
 	}
-	writeJSON(w, 200, map[string]any{"deliveries": ds})
+	return map[string]any{"deliveries": ds}, err
 }
 
-func (s *Server) cancel(w http.ResponseWriter, r *http.Request) {
-	s.mutate(w, r, s.Store.Cancel)
-}
-
-func (s *Server) retry(w http.ResponseWriter, r *http.Request) {
-	s.mutate(w, r, s.Store.Retry)
-}
-
-func (s *Server) mutate(w http.ResponseWriter, r *http.Request, fn func(context.Context, string) error) {
-	id := r.PathValue("id")
-	if err := fn(r.Context(), id); err != nil {
-		writeErr(w, err)
-		return
+// mutate applies fn (cancel, retry) to the run and returns the run.
+func (s *Server) mutate(fn func(context.Context, string) error) handlerFunc {
+	return func(_ http.ResponseWriter, r *http.Request) (any, error) {
+		id := r.PathValue("id")
+		if err := fn(r.Context(), id); err != nil {
+			return nil, err
+		}
+		return s.Store.GetRun(r.Context(), id)
 	}
-	run, err := s.Store.GetRun(r.Context(), id)
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	writeJSON(w, 200, run)
 }
 
-func (s *Server) decide(approve bool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func (s *Server) decide(approve bool) handlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) (any, error) {
 		stepID, err := strconv.ParseInt(r.PathValue("step"), 10, 64)
 		if err != nil {
-			writeErr(w, fmt.Errorf("%w: step id must be a number", core.ErrInvalid))
-			return
+			return nil, fmt.Errorf("%w: step id must be a number", core.ErrInvalid)
 		}
 		var body struct {
 			Note      string `json:"note"`
 			DecidedBy string `json:"decided_by"`
 		}
 		if r.ContentLength != 0 && !s.decode(w, r, &body) {
-			return
+			return nil, errWritten
 		}
 		id := r.PathValue("id")
 		if err := s.Store.DecideApproval(r.Context(), id, stepID, core.Approval{Approved: approve, Note: body.Note, DecidedBy: body.DecidedBy}); err != nil {
-			writeErr(w, err)
-			return
+			return nil, err
 		}
-		v, err := s.view(r.Context(), id)
-		if err != nil {
-			writeErr(w, err)
-			return
-		}
-		writeJSON(w, 200, v)
+		return s.view(r.Context(), id)
 	}
+}
+
+// addMessage continues a completed run as a conversation.
+func (s *Server) addMessage(w http.ResponseWriter, r *http.Request) (any, error) {
+	var body struct {
+		Content string `json:"content"`
+	}
+	if !s.decode(w, r, &body) {
+		return nil, errWritten
+	}
+	if strings.TrimSpace(body.Content) == "" {
+		return nil, fmt.Errorf("%w: content is required", core.ErrInvalid)
+	}
+	if err := s.checkSpend(r.Context()); err != nil {
+		return nil, err
+	}
+	id := r.PathValue("id")
+	if _, err := s.Store.AddMessage(r.Context(), id, body.Content, r.Header.Get("Idempotency-Key")); err != nil {
+		return nil, err
+	}
+	return s.view(r.Context(), id)
+}
+
+// kill simulates a worker crash mid-run, to show the run resuming from its saved steps.
+func (s *Server) kill(_ http.ResponseWriter, r *http.Request) (any, error) {
+	id := r.PathValue("id")
+	if s.Kill == nil {
+		return nil, fmt.Errorf("%w: kill works when the API and workers run in one process (dev, serve); otherwise kill -9 a worker", core.ErrNotRunnable)
+	}
+	if !s.Kill(id) {
+		return nil, fmt.Errorf("%w: run is not executing right now (it may be waiting, queued or finished)", core.ErrNotRunnable)
+	}
+	return s.view(r.Context(), id)
 }
 
 type pendingApproval struct {
@@ -354,28 +434,27 @@ type pendingApproval struct {
 }
 
 // approvals lists every tool call waiting for a human: an inbox.
-func (s *Server) approvals(w http.ResponseWriter, r *http.Request) {
-	runs, err := s.Store.ListRuns(r.Context(), store.ListFilter{Status: core.RunWaiting, Limit: 500})
+func (s *Server) approvals(_ http.ResponseWriter, r *http.Request) (any, error) {
+	steps, err := s.Store.PendingApprovals(r.Context())
 	if err != nil {
-		writeErr(w, err)
-		return
+		return nil, err
 	}
 	out := []pendingApproval{}
-	for _, run := range runs {
-		steps, err := s.Store.ListSteps(r.Context(), run.ID)
-		if err != nil {
-			continue
-		}
-		for _, st := range steps {
-			if st.Status == core.StepPendingApproval {
-				out = append(out, pendingApproval{
-					RunID: run.ID, StepID: st.ID, ToolName: st.ToolName, ToolInput: st.ToolInput,
-					Input: run.Input, Waiting: time.Since(st.CreatedAt), CreatedAt: st.CreatedAt,
-				})
+	runs := map[string]core.Run{}
+	for _, st := range steps {
+		run, ok := runs[st.RunID]
+		if !ok {
+			if run, err = s.Store.GetRun(r.Context(), st.RunID); err != nil {
+				continue
 			}
+			runs[st.RunID] = run
 		}
+		out = append(out, pendingApproval{
+			RunID: run.ID, StepID: st.ID, ToolName: st.ToolName, ToolInput: st.ToolInput,
+			Input: run.Input, Waiting: time.Since(st.CreatedAt), CreatedAt: st.CreatedAt,
+		})
 	}
-	writeJSON(w, 200, map[string]any{"approvals": out})
+	return map[string]any{"approvals": out}, nil
 }
 
 // ---- infrastructure ----
@@ -460,6 +539,8 @@ func writeErr(w http.ResponseWriter, err error) {
 		writeJSON(w, 400, errorBody("invalid_request", err.Error()))
 	case errors.Is(err, core.ErrNotRunnable), errors.Is(err, core.ErrConflict):
 		writeJSON(w, 409, errorBody("conflict", err.Error()))
+	case errors.Is(err, core.ErrLimit):
+		writeJSON(w, http.StatusTooManyRequests, errorBody("limit_reached", err.Error()))
 	default:
 		writeJSON(w, 500, errorBody("internal", "internal error"))
 	}

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -29,7 +30,7 @@ type env struct {
 	store *memory.Store
 }
 
-func setup(t *testing.T, token string) *env {
+func setup(t *testing.T, token string, opts ...func(*Server)) *env {
 	t.Helper()
 	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
 	shop := httptest.NewServer(demo.NewShop(time.Now()).Handler())
@@ -46,7 +47,11 @@ func setup(t *testing.T, token string) *env {
 	go func() { eng.Run(ctx); close(done) }()
 	t.Cleanup(func() { cancel(); <-done })
 
-	srv := httptest.NewServer((&Server{Store: st, Tools: runner, Router: router, Token: token, Log: quiet}).Handler())
+	s := &Server{Store: st, Tools: runner, Router: router, Token: token, Log: quiet}
+	for _, o := range opts {
+		o(s)
+	}
+	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 	return &env{t: t, url: srv.URL, shop: shop.URL + "/mcp", token: token, store: st}
 }
@@ -151,6 +156,60 @@ func TestCreateValidation(t *testing.T) {
 	}
 	if code, _ := e.do("GET", "/v1/runs/nope", ""); code != 404 {
 		t.Errorf("missing run = %d", code)
+	}
+}
+
+func TestMonthlyTokenLimit(t *testing.T) {
+	e := setup(t, "", func(s *Server) { s.MonthlyTokenLimit, s.UsageCacheTTL = 1, time.Nanosecond })
+	body := `{"agent":{"model":"mock"},"input":"hi"}`
+	_, run := e.do("POST", "/v1/runs", body)
+	e.waitStatus(run["id"].(string), "completed")
+	if code, out := e.do("POST", "/v1/runs", body); code != 429 {
+		t.Errorf("over the limit: %d %v", code, out)
+	}
+	_, u := e.do("GET", "/v1/usage", "")
+	if u["runs"] != 1.0 || u["tokens"].(float64) < 1 || u["monthly_token_limit"] != 1.0 {
+		t.Errorf("usage = %v", u)
+	}
+}
+
+func TestConversationOverHTTP(t *testing.T) {
+	e := setup(t, "")
+	_, run := e.do("POST", "/v1/runs", `{"agent":{"model":"mock"},"input":"hi"}`)
+	id := run["id"].(string)
+	e.waitStatus(id, "completed")
+	if code, _ := e.do("POST", "/v1/runs/"+id+"/messages", `{"content":"  "}`); code != 400 {
+		t.Errorf("empty message = %d", code)
+	}
+	if code, out := e.do("POST", "/v1/runs/"+id+"/messages", `{"content":"more please"}`); code != 200 || out["status"] != "queued" {
+		t.Fatalf("message = %d %v", code, out)
+	}
+	if done := e.waitStatus(id, "completed"); done["output"] != "mock: more please" {
+		t.Errorf("reply = %v", done["output"])
+	}
+	_, waiting := e.do("POST", "/v1/runs", refundBody(e.shop))
+	e.waitStatus(waiting["id"].(string), "waiting")
+	if code, _ := e.do("POST", "/v1/runs/"+waiting["id"].(string)+"/messages", `{"content":"hello?"}`); code != 409 {
+		t.Errorf("message to a waiting run = %d, want 409", code)
+	}
+}
+
+func TestKillNeedsWorkersInProcess(t *testing.T) {
+	e := setup(t, "") // like `stepwise api`: no workers in this process
+	_, run := e.do("POST", "/v1/runs", `{"agent":{"model":"mock"},"input":"hi"}`)
+	if code, out := e.do("POST", "/v1/runs/"+run["id"].(string)+"/kill", ""); code != 409 || !strings.Contains(fmt.Sprint(out), "kill -9") {
+		t.Errorf("kill without in-process workers = %d %v", code, out)
+	}
+}
+
+func TestTemperatureRejectedForClaude(t *testing.T) {
+	s := &Server{Router: provider.NewRouter(provider.Route{Prefix: "claude-", Provider: provider.NewMock()})}
+	temp := 0.2
+	if err := s.checkModels(core.AgentSpec{Model: "claude-x", Temperature: &temp}); !errors.Is(err, core.ErrInvalid) {
+		t.Errorf("temperature on a Claude model: %v", err)
+	}
+	if err := s.checkModels(core.AgentSpec{Model: "claude-x"}); err != nil {
+		t.Errorf("no temperature: %v", err)
 	}
 }
 

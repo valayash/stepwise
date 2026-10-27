@@ -28,7 +28,7 @@ func TestAnthropicComplete(t *testing.T) {
 		}
 		_, _ = w.Write([]byte(`{"id":"msg_1","stop_reason":"max_tokens",
 			"content":[{"type":"text","text":"Hello "},{"type":"text","text":"there"}],
-			"usage":{"input_tokens":12,"output_tokens":3}}`))
+			"usage":{"input_tokens":12,"output_tokens":3,"cache_creation_input_tokens":100,"cache_read_input_tokens":900}}`))
 	}))
 	defer srv.Close()
 
@@ -39,9 +39,14 @@ func TestAnthropicComplete(t *testing.T) {
 			{Role: "system", Content: "be brief"},
 			{Role: "user", Content: "hi"},
 		},
+		ResponseSchema: json.RawMessage(`{"type":"object"}`),
+		Cache:          true,
 	})
 	if err != nil {
 		t.Fatalf("Complete: %v", err)
+	}
+	if got.OutputConfig == nil || got.OutputConfig.Format.Type != "json_schema" || string(got.OutputConfig.Format.Schema) != `{"type":"object"}` {
+		t.Errorf("output_config = %+v", got.OutputConfig)
 	}
 
 	if got.System != "be brief" {
@@ -54,7 +59,11 @@ func TestAnthropicComplete(t *testing.T) {
 		t.Errorf("max_tokens = %d, want default %d", got.MaxTokens, anthropicDefaultMax)
 	}
 
-	want := Response{ID: "msg_1", Content: "Hello there", FinishReason: "length", InputTokens: 12, OutputTokens: 3}
+	if got.CacheControl == nil || got.CacheControl.Type != "ephemeral" {
+		t.Errorf("cache_control = %+v, want automatic ephemeral caching", got.CacheControl)
+	}
+	// input_tokens is only the uncached part; budgets must see the whole prompt.
+	want := Response{ID: "msg_1", Content: "Hello there", FinishReason: "length", InputTokens: 1012, CachedTokens: 900, OutputTokens: 3}
 	if !reflect.DeepEqual(res, want) {
 		t.Errorf("response = %+v, want %+v", res, want)
 	}
@@ -120,6 +129,9 @@ func TestAnthropicStream(t *testing.T) {
 	srv := sseServer(t, anthropicSSE, func(got anthropicRequest) {
 		if !got.Stream {
 			t.Error("request did not set stream=true")
+		}
+		if got.CacheControl != nil {
+			t.Error("a request without Cache (e.g. the gateway) must not pay the cache-write premium")
 		}
 	})
 	defer srv.Close()

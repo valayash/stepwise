@@ -87,11 +87,11 @@ jobs:
             sleep 2
           done
           echo "::error::trace $RUN not found in Jaeger"; exit 1
-      - name: Prometheus scrapes the API and both workers
+      - name: Prometheus scrapes the API, both workers and the webhook dispatcher
         run: |
           for i in $(seq 1 30); do
             UP=$(curl -sf http://localhost:9090/api/v1/targets | grep -o '"health":"up"' | wc -l)
-            [ "$UP" -ge 3 ] && echo "$UP targets up" && exit 0
+            [ "$UP" -ge 4 ] && echo "$UP targets up" && exit 0
             sleep 2
           done
           echo "::error::only $UP Prometheus targets up"; exit 1

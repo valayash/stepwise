@@ -17,6 +17,9 @@ type TriageConfig struct {
 	Model   string // model for the triage agent; defaults to "mock"
 	// AutoRetry lets the triage agent retry a run without a human approving.
 	AutoRetry bool
+	// MaxActive caps unfinished triage runs (default 10); past it, failures
+	// get a rule-based diagnosis instead, so a burst can't start hundreds.
+	MaxActive int
 }
 
 const triageSystemPrompt = `You are an SRE assistant. An AI agent run has failed. Diagnose it.
@@ -54,6 +57,17 @@ func (e *Engine) maybeTriage(ctx context.Context, failed core.Run, o store.Outco
 	if !e.cfg.Triage.Enabled || failed.ParentRunID != "" || triageOf(failed) != "" {
 		return
 	}
+	// Outages fail many runs at once and the rules already recognise them, so
+	// they get no LLM call; any other burst is capped by MaxActive.
+	cat := classify(o)
+	if cat == "transient" {
+		e.diagnoseByRules(ctx, failed, cat, "Provider or network failure: "+oneLine(o.Error)+". Retry once it recovers.")
+		return
+	}
+	if n, _ := e.store.CountActive(ctx, "triage_of"); n >= e.cfg.Triage.MaxActive {
+		e.diagnoseByRules(ctx, failed, cat, fmt.Sprintf("%s (rule-based: %d triage runs already active)", oneLine(o.Error), n))
+		return
+	}
 	model := e.cfg.Triage.Model
 	if model == "" {
 		model = "mock"
@@ -75,7 +89,7 @@ func (e *Engine) maybeTriage(ctx context.Context, failed core.Run, o store.Outco
 	}
 	meta, _ := json.Marshal(map[string]string{"triage_of": failed.ID})
 	input := fmt.Sprintf("Diagnose this failed run.\nrun_id: %s\nfailure_kind: %s\nerror: %s\ncategory: %s\n(The category above was suggested by simple rules. Confirm or correct it.)\nsummary: %s",
-		failed.ID, o.FailureKind, oneLine(o.Error), classify(o), oneLine(o.Error))
+		failed.ID, o.FailureKind, oneLine(o.Error), cat, oneLine(o.Error))
 
 	tr, _, err := e.store.CreateRun(ctx, core.NewRun{
 		Spec: spec.WithDefaults(), Input: input, BudgetTokens: 50_000, Metadata: meta,
@@ -88,6 +102,19 @@ func (e *Engine) maybeTriage(ctx context.Context, failed core.Run, o store.Outco
 	}
 	e.m.triaged.Inc()
 	e.log.Info("triage run started", "run_id", failed.ID, "triage_run_id", tr.ID)
+}
+
+// diagnoseByRules records a diagnosis without an LLM call. With AutoRetry, a
+// transient failure is retried once (never again if the retry fails too).
+func (e *Engine) diagnoseByRules(ctx context.Context, failed core.Run, category, summary string) {
+	d, _ := json.Marshal(map[string]string{"category": category, "summary": summary, "triaged_by": "rules"})
+	if err := e.store.SetTriage(ctx, failed.ID, d); err != nil {
+		e.log.Warn("could not record diagnosis", "run_id", failed.ID, "err", err)
+		return
+	}
+	if category == "transient" && e.cfg.Triage.AutoRetry && failed.Triage == nil {
+		_ = e.store.Retry(ctx, failed.ID)
+	}
 }
 
 // classify is a rule-based first guess the triage agent can confirm or override.

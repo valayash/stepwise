@@ -17,6 +17,8 @@ import (
 
 // Store is a mutex-guarded in-memory store.
 type Store struct {
+	store.Hub
+
 	mu         sync.Mutex
 	now        func() time.Time
 	runs       map[string]*core.Run
@@ -26,10 +28,6 @@ type Store struct {
 	deliveryTo map[int64]time.Time // delivery lease
 	nextStep   int64
 	nextDeliv  int64
-
-	subMu sync.Mutex
-	subs  map[int]chan store.Event
-	subID int
 }
 
 var _ store.Store = (*Store)(nil)
@@ -45,7 +43,6 @@ func New(now func() time.Time) *Store {
 		steps:      map[string][]*core.Step{},
 		idem:       map[string]string{},
 		deliveryTo: map[int64]time.Time{},
-		subs:       map[int]chan store.Event{},
 	}
 }
 
@@ -54,40 +51,42 @@ func (m *Store) Close() error { return nil }
 
 func clone[T any](v *T) T { return *v }
 
+// write runs fn under the lock, then publishes the events it returns. Every
+// mutation goes through here, so no error path can forget to unlock.
+func (m *Store) write(fn func(now time.Time) ([]store.Event, error)) error {
+	m.mu.Lock()
+	events, err := fn(m.now())
+	m.mu.Unlock()
+	m.Publish(events...)
+	return err
+}
+
 // ---- runs ----
 
 // CreateRun implements store.Store.
-func (m *Store) CreateRun(_ context.Context, nr core.NewRun) (core.Run, bool, error) {
-	m.mu.Lock()
-	if nr.IdempotencyKey != "" {
-		if id, ok := m.idem[nr.IdempotencyKey]; ok {
-			r := clone(m.runs[id])
-			m.mu.Unlock()
-			return r, false, nil
+func (m *Store) CreateRun(_ context.Context, nr core.NewRun) (r core.Run, created bool, err error) {
+	err = m.write(func(now time.Time) ([]store.Event, error) {
+		if id, ok := m.idem[nr.IdempotencyKey]; ok && nr.IdempotencyKey != "" {
+			r = clone(m.runs[id])
+			return nil, nil
 		}
-	}
-	r := newRun(nr, m.now())
-	stored := r // the map owns its own copy; r is returned without the lock
-	m.runs[r.ID] = &stored
-	if nr.IdempotencyKey != "" {
-		m.idem[nr.IdempotencyKey] = r.ID
-	}
-	m.mu.Unlock()
-	m.publish(store.Event{Type: store.EventRunsReady, RunID: r.ID})
-	return r, true, nil
+		r, created = m.insertRun(nr, now), true
+		if nr.IdempotencyKey != "" {
+			m.idem[nr.IdempotencyKey] = r.ID
+		}
+		return []store.Event{store.Ready(r.ID)}, nil
+	})
+	return r, created, err
 }
 
-func newRun(nr core.NewRun, now time.Time) core.Run {
-	budget := nr.BudgetTokens
-	if budget <= 0 {
-		budget = core.DefaultBudgetTokens
-	}
-	return core.Run{
+// insertRun stores a new queued run and returns a copy. Caller holds m.mu.
+func (m *Store) insertRun(nr core.NewRun, now time.Time) core.Run {
+	r := core.Run{
 		ID:             core.NewID(),
 		Status:         core.RunQueued,
 		Spec:           nr.Spec.WithDefaults(),
 		Input:          nr.Input,
-		BudgetTokens:   budget,
+		BudgetTokens:   nr.Budget(),
 		AvailableAt:    now,
 		ParentRunID:    nr.ParentRunID,
 		ParentStepID:   nr.ParentStepID,
@@ -97,6 +96,9 @@ func newRun(nr core.NewRun, now time.Time) core.Run {
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	}
+	stored := r // the map owns its own copy
+	m.runs[r.ID] = &stored
+	return r
 }
 
 // GetRun implements store.Store.
@@ -108,6 +110,40 @@ func (m *Store) GetRun(_ context.Context, id string) (core.Run, error) {
 		return core.Run{}, core.ErrNotFound
 	}
 	return clone(r), nil
+}
+
+// CountActive implements store.Store.
+func (m *Store) CountActive(_ context.Context, metadataKey string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, r := range m.runs {
+		var meta map[string]json.RawMessage
+		if !r.Status.Terminal() && json.Unmarshal(r.Metadata, &meta) == nil && meta[metadataKey] != nil {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// Usage implements store.Store.
+func (m *Store) Usage(_ context.Context, since time.Time) (store.Usage, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var u store.Usage
+	for _, r := range m.runs {
+		if r.ParentRunID == "" && !r.CreatedAt.Before(since) {
+			u.Runs++
+		}
+	}
+	for _, steps := range m.steps {
+		for _, s := range steps {
+			if s.Kind == core.StepLLM && s.CompletedAt != nil && !s.CompletedAt.Before(since) {
+				u.Tokens += s.Tokens()
+			}
+		}
+	}
+	return u, nil
 }
 
 // ListRuns implements store.Store. Newest first.
@@ -159,39 +195,42 @@ func (m *Store) stepsOf(runID string) []core.Step {
 // ---- workers ----
 
 // ClaimRuns implements store.Store.
-func (m *Store) ClaimRuns(_ context.Context, owner string, limit int, lease time.Duration) ([]core.Run, error) {
-	m.mu.Lock()
-	now := m.now()
-	var candidates []*core.Run
-	for _, r := range m.runs {
-		queued := r.Status == core.RunQueued && !r.AvailableAt.After(now)
-		orphaned := r.Status == core.RunRunning && r.LeaseExpiresAt != nil && r.LeaseExpiresAt.Before(now)
-		if queued || orphaned {
-			candidates = append(candidates, r)
+func (m *Store) ClaimRuns(_ context.Context, owner string, limit int, lease time.Duration) (out []core.Run, err error) {
+	err = m.write(func(now time.Time) ([]store.Event, error) {
+		var candidates []*core.Run
+		for _, r := range m.runs {
+			queued := r.Status == core.RunQueued && !r.AvailableAt.After(now)
+			orphaned := r.Status == core.RunRunning && r.LeaseExpiresAt != nil && r.LeaseExpiresAt.Before(now)
+			if queued || orphaned {
+				candidates = append(candidates, r)
+			}
 		}
-	}
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].AvailableAt.Before(candidates[j].AvailableAt)
+		sort.Slice(candidates, func(i, j int) bool { // orphaned runs first, like Postgres
+			a, b := candidates[i], candidates[j]
+			if (a.Status == core.RunRunning) != (b.Status == core.RunRunning) {
+				return a.Status == core.RunRunning
+			}
+			return a.AvailableAt.Before(b.AvailableAt)
+		})
+		if len(candidates) > limit {
+			candidates = candidates[:limit]
+		}
+		var events []store.Event
+		out = make([]core.Run, 0, len(candidates))
+		exp := now.Add(lease)
+		for _, r := range candidates {
+			r.Status = core.RunRunning
+			r.LeaseOwner = owner
+			r.Claims++
+			r.LeaseToken = int64(r.Claims)
+			r.LeaseExpiresAt = &exp
+			r.UpdatedAt = now
+			out = append(out, clone(r))
+			events = append(events, store.Changed(r.ID))
+		}
+		return events, nil
 	})
-	if len(candidates) > limit {
-		candidates = candidates[:limit]
-	}
-	out := make([]core.Run, 0, len(candidates))
-	exp := now.Add(lease)
-	for _, r := range candidates {
-		r.Status = core.RunRunning
-		r.LeaseOwner = owner
-		r.Claims++
-		r.LeaseToken = int64(r.Claims)
-		r.LeaseExpiresAt = &exp
-		r.UpdatedAt = now
-		out = append(out, clone(r))
-	}
-	m.mu.Unlock()
-	for _, r := range out {
-		m.publish(store.Event{Type: store.EventRunChanged, RunID: r.ID})
-	}
-	return out, nil
+	return out, err
 }
 
 // fenced returns the run if the fence is valid. Caller holds m.mu.
@@ -208,88 +247,81 @@ func (m *Store) fenced(f core.Fence) (*core.Run, error) {
 
 // Heartbeat implements store.Store.
 func (m *Store) Heartbeat(_ context.Context, f core.Fence, lease time.Duration) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	r, err := m.fenced(f)
-	if err != nil {
-		return err
-	}
-	exp := m.now().Add(lease)
-	r.LeaseExpiresAt = &exp
-	return nil
+	return m.write(func(now time.Time) ([]store.Event, error) {
+		r, err := m.fenced(f)
+		if err != nil {
+			return nil, err
+		}
+		exp := now.Add(lease)
+		r.LeaseExpiresAt = &exp
+		return nil, nil
+	})
 }
 
 // BeginStep implements store.Store.
-func (m *Store) BeginStep(_ context.Context, f core.Fence, s core.Step) (core.Step, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	r, err := m.fenced(f)
-	if err != nil {
-		return core.Step{}, err
-	}
-	now := m.now()
-	for _, ex := range m.steps[f.RunID] {
-		if ex.Seq != s.Seq {
-			continue
+func (m *Store) BeginStep(_ context.Context, f core.Fence, s core.Step) (out core.Step, err error) {
+	err = m.write(func(now time.Time) ([]store.Event, error) {
+		r, err := m.fenced(f)
+		if err != nil {
+			return nil, err
 		}
-		if ex.Status != core.StepRunning && ex.Status != core.StepApproved {
-			return core.Step{}, fmt.Errorf("%w: step %d is %s", core.ErrConflict, s.Seq, ex.Status)
+		for _, ex := range m.steps[f.RunID] {
+			if ex.Seq != s.Seq {
+				continue
+			}
+			if ex.Status != core.StepRunning && ex.Status != core.StepApproved {
+				return nil, fmt.Errorf("%w: step %d is %s", core.ErrConflict, s.Seq, ex.Status)
+			}
+			ex.Status = core.StepRunning
+			ex.Attempts++
+			out = clone(ex)
+			return nil, nil
 		}
-		ex.Status = core.StepRunning
-		ex.Attempts++
-		r.UpdatedAt = now
-		return clone(ex), nil
-	}
-	m.nextStep++
-	s.ID = m.nextStep
-	s.RunID = f.RunID
-	if s.Status == "" {
-		s.Status = core.StepRunning
-	}
-	if s.Status == core.StepRunning {
-		s.Attempts = 1
-	}
-	s.CreatedAt = now
-	m.steps[f.RunID] = append(m.steps[f.RunID], &s)
-	r.UpdatedAt = now
-	if s.Status == core.StepPendingApproval {
-		m.outbox(r, core.EventApprovalRequested, &s, now)
-	}
-	defer m.publish(store.Event{Type: store.EventRunChanged, RunID: f.RunID})
-	return s, nil
+		m.nextStep++
+		s.ID, s.RunID, s.CreatedAt = m.nextStep, f.RunID, now
+		if s.Status == "" {
+			s.Status = core.StepRunning
+		}
+		if s.Status == core.StepRunning {
+			s.Attempts = 1
+		}
+		m.steps[f.RunID] = append(m.steps[f.RunID], &s)
+		if s.Status == core.StepPendingApproval {
+			m.outbox(r, core.EventApprovalRequested, &s, now)
+		}
+		out = s
+		return nil, nil // no event per step: live views poll
+	})
+	return out, err
 }
 
 // SaveStep implements store.Store.
 func (m *Store) SaveStep(_ context.Context, f core.Fence, s core.Step) error {
-	m.mu.Lock()
-	r, err := m.fenced(f)
-	if err != nil {
-		m.mu.Unlock()
-		return err
-	}
-	ex := m.findStep(f.RunID, s.ID)
-	if ex == nil {
-		m.mu.Unlock()
-		return core.ErrNotFound
-	}
-	now := m.now()
-	wasCompleted := ex.Status == core.StepCompleted
-	attempts, created, id, seq := ex.Attempts, ex.CreatedAt, ex.ID, ex.Seq
-	*ex = s
-	ex.ID, ex.Seq, ex.RunID, ex.Attempts, ex.CreatedAt = id, seq, f.RunID, attempts, created
-	if ex.Status == core.StepCompleted && !wasCompleted {
-		ex.CompletedAt = &now
-		r.TokensUsed += ex.Tokens()
-		r.Attempts = 0
-		r.Error = ""
-	}
-	if ex.Status == core.StepPendingApproval {
-		m.outbox(r, core.EventApprovalRequested, ex, now)
-	}
-	r.UpdatedAt = now
-	m.mu.Unlock()
-	m.publish(store.Event{Type: store.EventRunChanged, RunID: f.RunID})
-	return nil
+	return m.write(func(now time.Time) ([]store.Event, error) {
+		r, err := m.fenced(f)
+		if err != nil {
+			return nil, err
+		}
+		ex := m.findStep(f.RunID, s.ID)
+		if ex == nil {
+			return nil, core.ErrNotFound
+		}
+		wasCompleted := ex.Status == core.StepCompleted
+		attempts, created, completed, id, seq := ex.Attempts, ex.CreatedAt, ex.CompletedAt, ex.ID, ex.Seq
+		*ex = s
+		ex.ID, ex.Seq, ex.RunID, ex.Attempts, ex.CreatedAt, ex.CompletedAt = id, seq, f.RunID, attempts, created, completed // stored fields, like Postgres
+		if ex.Status == core.StepCompleted && !wasCompleted {
+			ex.CompletedAt = &now
+			r.TokensUsed += ex.Tokens()
+			r.Attempts = 0
+			r.Error = ""
+		}
+		if ex.Status == core.StepPendingApproval {
+			m.outbox(r, core.EventApprovalRequested, ex, now)
+		}
+		r.UpdatedAt = now
+		return nil, nil // no event per step: live views poll
+	})
 }
 
 func (m *Store) findStep(runID string, id int64) *core.Step {
@@ -302,102 +334,87 @@ func (m *Store) findStep(runID string, id int64) *core.Step {
 }
 
 // SpawnChild implements store.Store.
-func (m *Store) SpawnChild(_ context.Context, f core.Fence, parent core.Step, nr core.NewRun) (core.Step, core.Run, error) {
-	m.mu.Lock()
-	r, err := m.fenced(f)
-	if err != nil {
-		m.mu.Unlock()
-		return core.Step{}, core.Run{}, err
-	}
-	now := m.now()
-	ps := m.findStep(f.RunID, parent.ID)
-	if ps == nil {
-		m.mu.Unlock()
-		return core.Step{}, core.Run{}, core.ErrNotFound
-	}
-	if ps.ChildRunID != "" { // already spawned before a crash: reuse the child
-		out, child := clone(ps), clone(m.runs[ps.ChildRunID])
-		m.mu.Unlock()
-		return out, child, nil
-	}
-	nr.ParentRunID, nr.ParentStepID = f.RunID, ps.ID
-	child := newRun(nr, now)
-	stored := child
-	m.runs[child.ID] = &stored
-	ps.Status = core.StepWaitingChild
-	ps.ChildRunID = child.ID
-	r.UpdatedAt = now
-	out := clone(ps)
-	m.mu.Unlock()
-	m.publish(store.Event{Type: store.EventRunsReady, RunID: child.ID})
-	m.publish(store.Event{Type: store.EventRunChanged, RunID: f.RunID})
-	return out, child, nil
+func (m *Store) SpawnChild(_ context.Context, f core.Fence, parent core.Step, nr core.NewRun) (out core.Step, child core.Run, err error) {
+	err = m.write(func(now time.Time) ([]store.Event, error) {
+		r, err := m.fenced(f)
+		if err != nil {
+			return nil, err
+		}
+		ps := m.findStep(f.RunID, parent.ID)
+		if ps == nil {
+			return nil, core.ErrNotFound
+		}
+		if ps.ChildRunID != "" { // already spawned before a crash: reuse the child
+			out, child = clone(ps), clone(m.runs[ps.ChildRunID])
+			return nil, nil
+		}
+		nr.ParentRunID, nr.ParentStepID = f.RunID, ps.ID
+		child = m.insertRun(nr, now)
+		ps.Status = core.StepWaitingChild
+		ps.ChildRunID = child.ID
+		r.UpdatedAt = now
+		out = clone(ps)
+		return []store.Event{store.Ready(child.ID), store.Changed(f.RunID)}, nil
+	})
+	return out, child, err
 }
 
 // Yield implements store.Store.
 func (m *Store) Yield(_ context.Context, f core.Fence, y store.Yield) error {
-	m.mu.Lock()
-	r, err := m.fenced(f)
-	if err != nil {
-		m.mu.Unlock()
-		return err
-	}
-	now := m.now()
-	switch y.Status {
-	case core.RunQueued:
-		r.AvailableAt = y.AvailableAt
-		if r.AvailableAt.IsZero() {
-			r.AvailableAt = now
+	return m.write(func(now time.Time) ([]store.Event, error) {
+		r, err := m.fenced(f)
+		if err != nil {
+			return nil, err
 		}
-	case core.RunWaiting:
-		// A sub-agent may have finished, or a decision arrived, while this
-		// worker still held the run. If nothing blocks anymore, requeue
-		// instead of waiting forever.
-		steps := m.stepsOf(r.ID)
-		if !store.Blocking(steps) || store.HasWork(steps) {
-			y.Status = core.RunQueued
-			r.AvailableAt = now
+		switch y.Status {
+		case core.RunQueued:
+			r.AvailableAt = y.AvailableAt
+			if r.AvailableAt.IsZero() {
+				r.AvailableAt = now
+			}
+		case core.RunWaiting:
+			// A sub-agent may have finished, or a decision arrived, while this
+			// worker still held the run. If nothing blocks anymore, requeue
+			// instead of waiting forever.
+			steps := m.stepsOf(r.ID)
+			if !store.Blocking(steps) || store.HasWork(steps) {
+				y.Status = core.RunQueued
+				r.AvailableAt = now
+			}
+		default:
+			return nil, fmt.Errorf("%w: yield status %q", core.ErrInvalid, y.Status)
 		}
-	default:
-		m.mu.Unlock()
-		return fmt.Errorf("%w: yield status %q", core.ErrInvalid, y.Status)
-	}
-	r.Status = y.Status
-	r.Attempts = y.Attempts
-	r.Error = y.Error
-	r.LeaseOwner, r.LeaseExpiresAt = "", nil
-	r.UpdatedAt = now
-	ready := r.Status == core.RunQueued
-	m.mu.Unlock()
-	m.publish(store.Event{Type: store.EventRunChanged, RunID: f.RunID})
-	if ready {
-		m.publish(store.Event{Type: store.EventRunsReady, RunID: f.RunID})
-	}
-	return nil
+		r.Status = y.Status
+		r.Attempts = y.Attempts
+		r.Error = y.Error
+		r.LeaseOwner, r.LeaseExpiresAt = "", nil
+		r.UpdatedAt = now
+		switch {
+		case r.Status == core.RunQueued && !r.AvailableAt.After(now):
+			return []store.Event{store.Ready(f.RunID)}, nil
+		case r.Status == core.RunWaiting:
+			return []store.Event{store.Changed(f.RunID)}, nil
+		}
+		return nil, nil
+	})
 }
 
 // Finish implements store.Store.
 func (m *Store) Finish(_ context.Context, f core.Fence, o store.Outcome) error {
-	m.mu.Lock()
-	r, err := m.fenced(f)
-	if err != nil {
-		m.mu.Unlock()
-		return err
-	}
-	if !o.Status.Terminal() {
-		m.mu.Unlock()
-		return fmt.Errorf("%w: finish status %q", core.ErrInvalid, o.Status)
-	}
-	now := m.now()
-	m.finishLocked(r, o, now)
-	parent := r.ParentRunID
-	m.mu.Unlock()
-	m.publish(store.Event{Type: store.EventRunChanged, RunID: f.RunID})
-	if parent != "" {
-		m.publish(store.Event{Type: store.EventRunChanged, RunID: parent})
-		m.publish(store.Event{Type: store.EventRunsReady, RunID: parent})
-	}
-	return nil
+	return m.write(func(now time.Time) ([]store.Event, error) {
+		r, err := m.fenced(f)
+		if err != nil {
+			return nil, err
+		}
+		if !o.Status.Terminal() {
+			return nil, fmt.Errorf("%w: finish status %q", core.ErrInvalid, o.Status)
+		}
+		m.finishLocked(r, o, now)
+		if r.ParentRunID != "" {
+			return []store.Event{store.Changed(f.RunID), store.Changed(r.ParentRunID), store.Ready(r.ParentRunID)}, nil
+		}
+		return []store.Event{store.Changed(f.RunID)}, nil
+	})
 }
 
 // finishLocked ends a run, writes its webhook and resolves its parent step.
@@ -407,13 +424,7 @@ func (m *Store) finishLocked(r *core.Run, o store.Outcome, now time.Time) {
 	r.LeaseOwner, r.LeaseExpiresAt = "", nil
 	r.CompletedAt = &now
 	r.UpdatedAt = now
-
-	event := map[core.RunStatus]string{
-		core.RunCompleted: core.EventRunCompleted,
-		core.RunFailed:    core.EventRunFailed,
-		core.RunCancelled: core.EventRunCancelled,
-	}[o.Status]
-	m.outbox(r, event, nil, now)
+	m.outbox(r, store.FinishEvent(o.Status), nil, now)
 
 	if r.ParentRunID == "" {
 		return
@@ -426,12 +437,7 @@ func (m *Store) finishLocked(r *core.Run, o store.Outcome, now time.Time) {
 	ps.Status = core.StepCompleted
 	ps.CompletedAt = &now
 	ps.DurationMs = now.Sub(ps.CreatedAt).Milliseconds()
-	if o.Status == core.RunCompleted {
-		ps.Result = o.Output
-	} else {
-		ps.Result = fmt.Sprintf("Sub-agent %s: %s", o.Status, o.Error)
-		ps.IsError = true
-	}
+	ps.Result, ps.IsError = store.ChildResult(o)
 	// Sub-agent tokens count against the parent's budget too.
 	parent.TokensUsed += r.TokensUsed
 	if parent.Status == core.RunWaiting && !store.Blocking(m.stepsOf(parent.ID)) {
@@ -452,126 +458,185 @@ func (m *Store) outbox(r *core.Run, event string, step *core.Step, now time.Time
 		Payload: store.WebhookPayload(event, *r, step, now), Status: store.DeliveryPending,
 		NextAttemptAt: now, CreatedAt: now,
 	})
+	m.Publish(store.Deliveries(r.ID))
 }
 
 // ---- humans ----
 
-// DecideApproval implements store.Store.
-func (m *Store) DecideApproval(_ context.Context, runID string, stepID int64, a core.Approval) error {
+// PendingApprovals implements store.Store.
+func (m *Store) PendingApprovals(_ context.Context) ([]core.Step, error) {
 	m.mu.Lock()
-	r, ok := m.runs[runID]
-	if !ok {
-		m.mu.Unlock()
-		return core.ErrNotFound
-	}
-	s := m.findStep(runID, stepID)
-	if s == nil {
-		m.mu.Unlock()
-		return core.ErrNotFound
-	}
-	if s.Status != core.StepPendingApproval || r.Status.Terminal() {
-		err := fmt.Errorf("%w: step is %s", core.ErrNotRunnable, s.Status) // read before unlocking
-		m.mu.Unlock()
-		return err
-	}
-	now := m.now()
-	a.DecidedAt = now
-	s.Approval = &a
-	if a.Approved {
-		s.Status = core.StepApproved
-	} else {
-		s.Status = core.StepCompleted
-		s.CompletedAt = &now
-		s.IsError = true
-		s.Result = "The reviewer rejected this action."
-		if a.Note != "" {
-			s.Result += " Reviewer note: " + a.Note
+	defer m.mu.Unlock()
+	var out []core.Step
+	for runID, steps := range m.steps {
+		if m.runs[runID].Status.Terminal() {
+			continue
+		}
+		for _, s := range steps {
+			if s.Status == core.StepPendingApproval {
+				out = append(out, clone(s))
+			}
 		}
 	}
-	steps := m.stepsOf(runID)
-	if r.Status == core.RunWaiting && (store.HasWork(steps) || !store.Blocking(steps)) {
-		r.Status = core.RunQueued
-		r.AvailableAt = now
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out, nil
+}
+
+// DeleteFinished implements store.Store.
+func (m *Store) DeleteFinished(_ context.Context, before time.Time, limit int) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	var del func(id string)
+	del = func(id string) {
+		for cid, c := range m.runs {
+			if c.ParentRunID == id {
+				del(cid)
+			}
+		}
+		delete(m.idem, m.runs[id].IdempotencyKey)
+		delete(m.runs, id)
+		delete(m.steps, id)
+		n++
 	}
-	r.UpdatedAt = now
-	m.mu.Unlock()
-	m.publish(store.Event{Type: store.EventRunChanged, RunID: runID})
-	m.publish(store.Event{Type: store.EventRunsReady, RunID: runID})
-	return nil
+	for id, r := range m.runs {
+		if limit > 0 && r.ParentRunID == "" && r.Status.Terminal() && r.CompletedAt != nil && r.CompletedAt.Before(before) {
+			del(id)
+			limit--
+		}
+	}
+	kept := m.deliveries[:0]
+	for _, d := range m.deliveries {
+		if _, ok := m.runs[d.RunID]; ok {
+			kept = append(kept, d)
+		} else {
+			delete(m.deliveryTo, d.ID)
+		}
+	}
+	m.deliveries = kept
+	return n, nil
+}
+
+// DecideApproval implements store.Store.
+func (m *Store) DecideApproval(_ context.Context, runID string, stepID int64, a core.Approval) error {
+	return m.write(func(now time.Time) ([]store.Event, error) {
+		r, ok := m.runs[runID]
+		s := m.findStep(runID, stepID)
+		if !ok || s == nil {
+			return nil, core.ErrNotFound
+		}
+		if s.Status != core.StepPendingApproval || r.Status.Terminal() {
+			return nil, fmt.Errorf("%w: step is %s", core.ErrNotRunnable, s.Status)
+		}
+		a.DecidedAt = now
+		s.Approval = &a
+		if a.Approved {
+			s.Status = core.StepApproved
+		} else {
+			s.Status = core.StepCompleted
+			s.CompletedAt = &now
+			s.IsError = true
+			s.Result = store.RejectionResult(a.Note)
+		}
+		steps := m.stepsOf(runID)
+		if r.Status == core.RunWaiting && (store.HasWork(steps) || !store.Blocking(steps)) {
+			r.Status = core.RunQueued
+			r.AvailableAt = now
+		}
+		r.UpdatedAt = now
+		return []store.Event{store.Changed(runID), store.Ready(runID)}, nil
+	})
 }
 
 // Cancel implements store.Store. Children of a cancelled run are cancelled too.
 func (m *Store) Cancel(_ context.Context, runID string) error {
-	m.mu.Lock()
-	r, ok := m.runs[runID]
-	if !ok {
-		m.mu.Unlock()
-		return core.ErrNotFound
-	}
-	if r.Status.Terminal() {
-		err := fmt.Errorf("%w: run is %s", core.ErrNotRunnable, r.Status) // read before unlocking
-		m.mu.Unlock()
-		return err
-	}
-	now := m.now()
-	changed := []string{}
-	var cancel func(r *core.Run)
-	cancel = func(r *core.Run) {
-		m.finishLocked(r, store.Outcome{Status: core.RunCancelled, Error: "cancelled"}, now)
-		changed = append(changed, r.ID)
-		for _, c := range m.runs {
-			if c.ParentRunID == r.ID && !c.Status.Terminal() {
-				cancel(c)
+	return m.write(func(now time.Time) ([]store.Event, error) {
+		r, ok := m.runs[runID]
+		if !ok {
+			return nil, core.ErrNotFound
+		}
+		if r.Status.Terminal() {
+			return nil, fmt.Errorf("%w: run is %s", core.ErrNotRunnable, r.Status)
+		}
+		var events []store.Event
+		var cancel func(r *core.Run)
+		cancel = func(r *core.Run) {
+			m.finishLocked(r, store.Outcome{Status: core.RunCancelled, Error: "cancelled"}, now)
+			events = append(events, store.Changed(r.ID))
+			for _, c := range m.runs {
+				if c.ParentRunID == r.ID && !c.Status.Terminal() {
+					cancel(c)
+				}
 			}
 		}
-	}
-	cancel(r)
-	m.mu.Unlock()
-	for _, id := range changed {
-		m.publish(store.Event{Type: store.EventRunChanged, RunID: id})
-	}
-	return nil
+		cancel(r)
+		return events, nil
+	})
 }
 
 // Retry implements store.Store.
 func (m *Store) Retry(_ context.Context, runID string) error {
-	m.mu.Lock()
-	r, ok := m.runs[runID]
-	if !ok {
-		m.mu.Unlock()
-		return core.ErrNotFound
-	}
-	if r.Status != core.RunFailed {
-		err := fmt.Errorf("%w: only failed runs can be retried (run is %s)", core.ErrNotRunnable, r.Status) // read before unlocking
-		m.mu.Unlock()
-		return err
-	}
-	now := m.now()
-	r.Status = core.RunQueued
-	r.AvailableAt = now
-	r.Attempts = 0
-	r.Error, r.FailureKind, r.CompletedAt = "", "", nil
-	r.UpdatedAt = now
-	m.mu.Unlock()
-	m.publish(store.Event{Type: store.EventRunChanged, RunID: runID})
-	m.publish(store.Event{Type: store.EventRunsReady, RunID: runID})
-	return nil
+	return m.write(func(now time.Time) ([]store.Event, error) {
+		r, ok := m.runs[runID]
+		if !ok {
+			return nil, core.ErrNotFound
+		}
+		if r.Status != core.RunFailed {
+			return nil, fmt.Errorf("%w: only failed runs can be retried (run is %s)", core.ErrNotRunnable, r.Status)
+		}
+		return reopen(r, now), nil
+	})
+}
+
+// AddMessage implements store.Store.
+func (m *Store) AddMessage(_ context.Context, runID, content, idempotencyKey string) (out core.Step, err error) {
+	err = m.write(func(now time.Time) ([]store.Event, error) {
+		r, ok := m.runs[runID]
+		if !ok {
+			return nil, core.ErrNotFound
+		}
+		for _, s := range m.steps[runID] {
+			if idempotencyKey != "" && s.Kind == core.StepUser && s.ToolCallID == idempotencyKey {
+				out = clone(s) // a repeat: return the first message, change nothing
+				return nil, nil
+			}
+		}
+		if r.Status != core.RunCompleted || r.ParentRunID != "" {
+			return nil, fmt.Errorf("%w: messages continue completed top-level runs (run is %s)", core.ErrNotRunnable, r.Status)
+		}
+		seq := 1
+		if steps := m.stepsOf(runID); len(steps) > 0 {
+			seq = steps[len(steps)-1].Seq + 1
+		}
+		m.nextStep++
+		st := &core.Step{ID: m.nextStep, RunID: runID, Seq: seq, Kind: core.StepUser, Status: core.StepCompleted,
+			Result: content, ToolCallID: idempotencyKey, CreatedAt: now, CompletedAt: &now}
+		m.steps[runID] = append(m.steps[runID], st)
+		out = clone(st)
+		return reopen(r, now), nil
+	})
+	return out, err
+}
+
+// reopen puts a finished run back in the queue (retry, or the next turn of a conversation).
+func reopen(r *core.Run, now time.Time) []store.Event {
+	r.Status, r.AvailableAt, r.Attempts, r.UpdatedAt = core.RunQueued, now, 0, now
+	r.Output, r.Error, r.FailureKind, r.CompletedAt = "", "", "", nil
+	return []store.Event{store.Changed(r.ID), store.Ready(r.ID)}
 }
 
 // SetTriage implements store.Store.
 func (m *Store) SetTriage(_ context.Context, runID string, d json.RawMessage) error {
-	m.mu.Lock()
-	r, ok := m.runs[runID]
-	if !ok {
-		m.mu.Unlock()
-		return core.ErrNotFound
-	}
-	r.Triage = d
-	r.UpdatedAt = m.now()
-	m.outbox(r, core.EventRunTriaged, nil, r.UpdatedAt)
-	m.mu.Unlock()
-	m.publish(store.Event{Type: store.EventRunChanged, RunID: runID})
-	return nil
+	return m.write(func(now time.Time) ([]store.Event, error) {
+		r, ok := m.runs[runID]
+		if !ok {
+			return nil, core.ErrNotFound
+		}
+		r.Triage = d
+		r.UpdatedAt = now
+		m.outbox(r, core.EventRunTriaged, nil, now)
+		return []store.Event{store.Changed(runID)}, nil
+	})
 }
 
 // ---- webhook outbox ----
@@ -601,30 +666,30 @@ func (m *Store) ClaimDeliveries(_ context.Context, limit int, lease time.Duratio
 
 // CompleteDelivery implements store.Store.
 func (m *Store) CompleteDelivery(_ context.Context, id int64) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, d := range m.deliveries {
-		if d.ID == id {
-			d.Status = store.DeliveryDelivered
-			d.LastError = ""
-			delete(m.deliveryTo, id)
-			return nil
-		}
-	}
-	return core.ErrNotFound
+	return m.updateDelivery(id, func(d *store.Delivery) {
+		d.Status = store.DeliveryDelivered
+		d.LastError = ""
+	})
 }
 
 // FailDelivery implements store.Store.
 func (m *Store) FailDelivery(_ context.Context, id int64, next time.Time, errMsg string, dead bool) error {
+	return m.updateDelivery(id, func(d *store.Delivery) {
+		d.LastError = errMsg
+		d.NextAttemptAt = next
+		if dead {
+			d.Status = store.DeliveryDead
+		}
+	})
+}
+
+// updateDelivery applies fn to a delivery and releases its lease.
+func (m *Store) updateDelivery(id int64, fn func(*store.Delivery)) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, d := range m.deliveries {
 		if d.ID == id {
-			d.LastError = errMsg
-			d.NextAttemptAt = next
-			if dead {
-				d.Status = store.DeliveryDead
-			}
+			fn(d)
 			delete(m.deliveryTo, id)
 			return nil
 		}
@@ -643,35 +708,4 @@ func (m *Store) ListDeliveries(_ context.Context, runID string) ([]store.Deliver
 		}
 	}
 	return out, nil
-}
-
-// ---- notifications ----
-
-// Subscribe implements store.Store.
-func (m *Store) Subscribe() (<-chan store.Event, func()) {
-	ch := make(chan store.Event, 64)
-	m.subMu.Lock()
-	m.subID++
-	id := m.subID
-	m.subs[id] = ch
-	m.subMu.Unlock()
-	var once sync.Once
-	return ch, func() {
-		once.Do(func() {
-			m.subMu.Lock()
-			delete(m.subs, id)
-			m.subMu.Unlock()
-		})
-	}
-}
-
-func (m *Store) publish(e store.Event) {
-	m.subMu.Lock()
-	defer m.subMu.Unlock()
-	for _, ch := range m.subs {
-		select {
-		case ch <- e:
-		default: // slow subscriber: drop, they also poll
-		}
-	}
 }
