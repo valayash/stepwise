@@ -188,6 +188,8 @@ in this order:
 
 Pulled in only when real users need them:
 
+- Long-term memory across runs (every cloud platform and Letta have it; see
+  [docs/research/competitors.md](research/competitors.md)); until then, memory as an MCP tool
 - Live token streaming into the run timeline (ephemeral deltas over the `/events` stream);
   revisit right after Conversations, since chat is where it matters
 - Usage tab in the UI (the `/v1/usage` API lands with the spend limit)
@@ -195,4 +197,4 @@ Pulled in only when real users need them:
 - Login and accounts: users, sessions, a signup flow
 - Billing: Razorpay and Stripe, plans, prepaid credits
 - Per-org webhook secrets, tool secrets and model keys
-- Python and TypeScript SDKs, fair scheduling, customer-hosted workers, SSO, SOC 2
+- Python and TypeScript SDKs (every competitor has them), fair scheduling, customer-hosted workers, SSO, SOC 2
