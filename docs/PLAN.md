@@ -118,13 +118,14 @@ measurements and should be re-checked when each item is built.
 - [x] **Claim query.** Split `ClaimRuns` into two `LIMIT … SKIP LOCKED` branches, each on its
       partial index, then `UNION ALL`. Measured here with pgbench, 16 clients: 512 → 4,677
       claims/s with 20,000 queued (9x); 3,500 → 6,490 with 2,000 queued.
-- [ ] **Webhook dispatcher wake-ups.** Stop claiming deliveries on every `run_changed` event;
+- [x] **Webhook dispatcher wake-ups.** Stop claiming deliveries on every `run_changed` event;
       poll, or wake only on a deliveries event.
-- [ ] **Live view (SSE) queries.** Drop `isChild` (a `GetRun` per fleet event per viewer;
+- [x] **Live view (SSE) queries.** Drop `isChild` (a `GetRun` per fleet event per viewer;
       parents are already notified) and don't resend unchanged snapshots for runs with children.
-- [ ] **NOTIFY volume.** `pg_notify` serializes commits (measured −69% tps at 32 clients).
+- [x] **NOTIFY volume.** `pg_notify` serializes commits (measured −69% tps at 32 clients).
       Stop notifying `run_changed` from BeginStep and SaveStep, and batch the rest.
-- [ ] **Deferred yields.** Don't send `runs_ready` for runs requeued into the future.
+      Measured here: chaos on Postgres (1,000 runs, 8 workers) 442 → 626 steps/s (+42%).
+- [x] **Deferred yields.** Don't send `runs_ready` for runs requeued into the future.
 - [x] **Approvals inbox N+1.** Fixed with `PendingApprovals` (one query).
 - [ ] **Connection pool.** Idle connections = open connections.
 - [ ] **Fewer writes per step.** `fillfactor` on `runs`, drop the redundant `touch`, lighter

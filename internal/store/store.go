@@ -139,7 +139,8 @@ type Delivery struct {
 // Event types on the Subscribe channel.
 const (
 	EventRunsReady  = "runs_ready"  // something became claimable
-	EventRunChanged = "run_changed" // a run or its steps changed
+	EventRunChanged = "run_changed" // a run changed state (not sent for every step: live views poll)
+	EventDeliveries = "deliveries"  // a webhook was queued
 )
 
 // Event is a change notification.
@@ -151,6 +152,9 @@ type Event struct {
 // Changed and Ready build the two kinds of Event.
 func Changed(runID string) Event { return Event{Type: EventRunChanged, RunID: runID} }
 func Ready(runID string) Event   { return Event{Type: EventRunsReady, RunID: runID} }
+
+// Deliveries announces a queued webhook.
+func Deliveries(runID string) Event { return Event{Type: EventDeliveries, RunID: runID} }
 
 // Hub fans events out to subscribers. Stores embed it to implement Subscribe.
 // The zero value is ready to use.

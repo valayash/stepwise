@@ -3,6 +3,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"embed"
@@ -272,8 +273,13 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
 	rc := http.NewResponseController(w)
+	var last []byte
 	send := func(v runView) bool {
 		b, _ := json.Marshal(v)
+		if bytes.Equal(b, last) {
+			return true // nothing changed since the last snapshot
+		}
+		last = b
 		if _, err := fmt.Fprintf(w, "event: run\ndata: %s\n\n", b); err != nil {
 			return false
 		}
@@ -283,11 +289,12 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Stores notify on run state changes, not on every step, so the view also
+	// polls; the run's own events just make state changes show up sooner.
 	keepalive := time.NewTicker(15 * time.Second)
 	defer keepalive.Stop()
-	poll := time.NewTicker(2 * time.Second) // events are best-effort; poll as a backstop
+	poll := time.NewTicker(time.Second)
 	defer poll.Stop()
-	last := v.UpdatedAt
 	for {
 		select {
 		case <-r.Context().Done():
@@ -298,31 +305,16 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		case ev := <-ch:
-			if ev.RunID != id && !s.isChild(r.Context(), ev.RunID, id) {
+			if ev.RunID != id {
 				continue
 			}
 		case <-poll.C:
 		}
 		v, err := s.view(r.Context(), id)
-		if err != nil {
-			return
-		}
-		if v.UpdatedAt.Equal(last) && len(v.Children) == 0 {
-			continue
-		}
-		last = v.UpdatedAt
-		if !send(v) || v.Status.Terminal() {
+		if err != nil || !send(v) || v.Status.Terminal() {
 			return
 		}
 	}
-}
-
-func (s *Server) isChild(ctx context.Context, childID, parentID string) bool {
-	if childID == "" {
-		return false
-	}
-	r, err := s.Store.GetRun(ctx, childID)
-	return err == nil && r.ParentRunID == parentID
 }
 
 func (s *Server) deliveries(_ http.ResponseWriter, r *http.Request) (any, error) {

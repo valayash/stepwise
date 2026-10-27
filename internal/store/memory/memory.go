@@ -271,7 +271,7 @@ func (m *Store) BeginStep(_ context.Context, f core.Fence, s core.Step) (out cor
 			m.outbox(r, core.EventApprovalRequested, &s, now)
 		}
 		out = s
-		return []store.Event{store.Changed(f.RunID)}, nil
+		return nil, nil // no event per step: live views poll
 	})
 	return out, err
 }
@@ -301,7 +301,7 @@ func (m *Store) SaveStep(_ context.Context, f core.Fence, s core.Step) error {
 			m.outbox(r, core.EventApprovalRequested, ex, now)
 		}
 		r.UpdatedAt = now
-		return []store.Event{store.Changed(f.RunID)}, nil
+		return nil, nil // no event per step: live views poll
 	})
 }
 
@@ -370,10 +370,13 @@ func (m *Store) Yield(_ context.Context, f core.Fence, y store.Yield) error {
 		r.Error = y.Error
 		r.LeaseOwner, r.LeaseExpiresAt = "", nil
 		r.UpdatedAt = now
-		if r.Status == core.RunQueued {
-			return []store.Event{store.Changed(f.RunID), store.Ready(f.RunID)}, nil
+		switch {
+		case r.Status == core.RunQueued && !r.AvailableAt.After(now):
+			return []store.Event{store.Ready(f.RunID)}, nil
+		case r.Status == core.RunWaiting:
+			return []store.Event{store.Changed(f.RunID)}, nil
 		}
-		return []store.Event{store.Changed(f.RunID)}, nil
+		return nil, nil
 	})
 }
 
@@ -436,6 +439,7 @@ func (m *Store) outbox(r *core.Run, event string, step *core.Step, now time.Time
 		Payload: store.WebhookPayload(event, *r, step, now), Status: store.DeliveryPending,
 		NextAttemptAt: now, CreatedAt: now,
 	})
+	m.Publish(store.Deliveries(r.ID))
 }
 
 // ---- humans ----
