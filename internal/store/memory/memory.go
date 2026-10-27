@@ -561,13 +561,39 @@ func (m *Store) Retry(_ context.Context, runID string) error {
 		if r.Status != core.RunFailed {
 			return nil, fmt.Errorf("%w: only failed runs can be retried (run is %s)", core.ErrNotRunnable, r.Status)
 		}
-		r.Status = core.RunQueued
-		r.AvailableAt = now
-		r.Attempts = 0
-		r.Error, r.FailureKind, r.CompletedAt = "", "", nil
-		r.UpdatedAt = now
-		return []store.Event{store.Changed(runID), store.Ready(runID)}, nil
+		return reopen(r, now), nil
 	})
+}
+
+// AddMessage implements store.Store.
+func (m *Store) AddMessage(_ context.Context, runID, content string) (out core.Step, err error) {
+	err = m.write(func(now time.Time) ([]store.Event, error) {
+		r, ok := m.runs[runID]
+		if !ok {
+			return nil, core.ErrNotFound
+		}
+		if r.Status != core.RunCompleted || r.ParentRunID != "" {
+			return nil, fmt.Errorf("%w: messages continue completed top-level runs (run is %s)", core.ErrNotRunnable, r.Status)
+		}
+		seq := 1
+		if steps := m.stepsOf(runID); len(steps) > 0 {
+			seq = steps[len(steps)-1].Seq + 1
+		}
+		m.nextStep++
+		st := &core.Step{ID: m.nextStep, RunID: runID, Seq: seq, Kind: core.StepUser, Status: core.StepCompleted,
+			Result: content, CreatedAt: now, CompletedAt: &now}
+		m.steps[runID] = append(m.steps[runID], st)
+		out = clone(st)
+		return reopen(r, now), nil
+	})
+	return out, err
+}
+
+// reopen puts a finished run back in the queue (retry, or the next turn of a conversation).
+func reopen(r *core.Run, now time.Time) []store.Event {
+	r.Status, r.AvailableAt, r.Attempts, r.UpdatedAt = core.RunQueued, now, 0, now
+	r.Output, r.Error, r.FailureKind, r.CompletedAt = "", "", "", nil
+	return []store.Event{store.Changed(r.ID), store.Ready(r.ID)}
 }
 
 // SetTriage implements store.Store.

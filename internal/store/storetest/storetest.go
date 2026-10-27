@@ -34,6 +34,7 @@ func Run(t *testing.T, newStore Factory) {
 		"SubAgentResolvesParent":        testSubAgent,
 		"CancelCascadesAndFences":       testCancel,
 		"RetryFailedRun":                testRetry,
+		"MessageContinuesRun":           testConversation,
 		"WebhookOutbox":                 testOutbox,
 		"ConcurrentClaimsNeverOverlap":  testConcurrentClaims,
 		"ListRunsFilters":               testListRuns,
@@ -509,5 +510,34 @@ func testListRuns(t *testing.T, s store.Store) {
 	limited, _ := s.ListRuns(ctx, store.ListFilter{Limit: 2})
 	if len(all) != 3 || len(queued) != 2 || len(limited) != 2 {
 		t.Errorf("all=%d queued=%d limited=%d", len(all), len(queued), len(limited))
+	}
+}
+
+func testConversation(t *testing.T, s store.Store) {
+	mustCreate(t, s, core.NewRun{Input: "hi"})
+	r := claimOne(t, s, "w1", time.Minute)
+	if _, err := s.AddMessage(ctx, r.ID, "too early"); !errors.Is(err, core.ErrNotRunnable) {
+		t.Errorf("message to a running run: %v", err)
+	}
+	st, _ := s.BeginStep(ctx, fence(r), core.Step{Seq: 1, Kind: core.StepLLM})
+	st.Status, st.LLM = core.StepCompleted, &provider.Response{Content: "hello"}
+	_ = s.SaveStep(ctx, fence(r), st)
+	if err := s.Finish(ctx, fence(r), store.Outcome{Status: core.RunCompleted, Output: "hello"}); err != nil {
+		t.Fatal(err)
+	}
+
+	msg, err := s.AddMessage(ctx, r.ID, "and then?")
+	if err != nil || msg.Kind != core.StepUser || msg.Seq != 2 || msg.Result != "and then?" || msg.Status != core.StepCompleted {
+		t.Fatalf("AddMessage = %+v, %v", msg, err)
+	}
+	got, _ := s.GetRun(ctx, r.ID)
+	if got.Status != core.RunQueued || got.Output != "" || got.CompletedAt != nil {
+		t.Errorf("run after a message: status %s output %q completed %v", got.Status, got.Output, got.CompletedAt)
+	}
+	if again := claimOne(t, s, "w2", time.Minute); again.ID != r.ID {
+		t.Errorf("claimed %s, want the reopened run", again.ID)
+	}
+	if _, err := s.AddMessage(ctx, "nope", "x"); !errors.Is(err, core.ErrNotFound) {
+		t.Errorf("message to a missing run: %v", err)
 	}
 }

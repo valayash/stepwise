@@ -902,14 +902,41 @@ func (s *Store) Retry(ctx context.Context, runID string) error {
 		if r.Status != core.RunFailed {
 			return fmt.Errorf("%w: only failed runs can be retried (run is %s)", core.ErrNotRunnable, r.Status)
 		}
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE runs SET status = 'queued', available_at = now(), attempts = 0, error = '',
-			       failure_kind = '', completed_at = NULL, updated_at = now()
-			WHERE id = $1`, runID); err != nil {
+		return reopen(ctx, tx, runID)
+	})
+}
+
+// AddMessage implements store.Store.
+func (s *Store) AddMessage(ctx context.Context, runID, content string) (core.Step, error) {
+	var out core.Step
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
+		r, err := lockRun(ctx, tx, runID)
+		if err != nil {
 			return err
 		}
-		return notify(ctx, tx, store.Changed(runID), store.Ready(runID))
+		if r.Status != core.RunCompleted || r.ParentRunID != "" {
+			return fmt.Errorf("%w: messages continue completed top-level runs (run is %s)", core.ErrNotRunnable, r.Status)
+		}
+		if out, err = scanStep(tx.QueryRowContext(ctx, `
+			INSERT INTO steps (run_id, seq, kind, status, result, completed_at)
+			SELECT $1, COALESCE(max(seq), 0) + 1, 'user', 'completed', $2, now() FROM steps WHERE run_id = $1
+			RETURNING `+stepCols, runID, content)); err != nil {
+			return err
+		}
+		return reopen(ctx, tx, runID)
 	})
+	return out, err
+}
+
+// reopen puts a finished run back in the queue (retry, or the next turn of a conversation).
+func reopen(ctx context.Context, tx *sql.Tx, runID string) error {
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE runs SET status = 'queued', available_at = now(), attempts = 0, output = '', error = '',
+		       failure_kind = '', completed_at = NULL, updated_at = now()
+		WHERE id = $1`, runID); err != nil {
+		return err
+	}
+	return notify(ctx, tx, store.Changed(runID), store.Ready(runID))
 }
 
 // SetTriage implements store.Store.

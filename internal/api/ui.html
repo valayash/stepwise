@@ -152,8 +152,8 @@ async function refresh() {
 
 function stepCard(r, s) {
   const tokens = s.llm ? s.llm.input_tokens + s.llm.output_tokens : 0;
-  const title = s.kind === "llm" ? "Model" : "Tool · " + esc(s.tool_name);
-  let body = "";
+  const title = s.kind === "llm" ? "Model" : s.kind === "user" ? "Message" : "Tool · " + esc(s.tool_name);
+  let body = s.kind === "user" ? `<pre>${esc(s.result)}</pre>` : "";
   if (s.llm) {
     if (s.llm.content) body += `<pre>${esc(s.llm.content)}</pre>`;
     (s.llm.tool_calls || []).forEach(c => body += `<div class="meta">→ calls <b>${esc(c.name)}</b> <code>${esc(JSON.stringify(c.input))}</code></div>`);
@@ -197,10 +197,14 @@ function renderRun(r) {
     ${r.error ? `<div class="box err"><h3>${esc(r.failure_kind || "Error")}</h3><pre>${esc(r.error)}</pre></div>` : ""}
     ${triage}
     <div class="timeline">${r.steps.map(s => stepCard(r, s)).join("") || `<div class="meta">No steps yet.</div>`}</div>
+    ${r.status === "completed" && !r.parent_run_id ? `<div class="box"><h3>Continue the conversation</h3>
+      <textarea id="msg" rows="2" style="width:100%" placeholder="Send a follow-up message"></textarea>
+      <div class="actions"><button class="primary" id="send">Send</button></div></div>` : ""}
     <div class="notice" id="actErr"></div>`;
   const act = async (p, b) => { try { await api(p, {method: "POST", body: JSON.stringify(b || {})}); load(r.id); refresh(); } catch (e) { $("#actErr").textContent = e.message; } };
   $("#cancel") && ($("#cancel").onclick = () => act(`/v1/runs/${r.id}/cancel`));
   $("#retry") && ($("#retry").onclick = () => act(`/v1/runs/${r.id}/retry`));
+  $("#send") && ($("#send").onclick = async () => { await act(`/v1/runs/${r.id}/messages`, {content: $("#msg").value}); select(r.id); });
   $("#detail").querySelectorAll("[data-approve]").forEach(b => b.onclick = () => act(`/v1/runs/${r.id}/steps/${b.dataset.approve}/approve`, {decided_by: "web-ui"}));
   $("#detail").querySelectorAll("[data-reject]").forEach(b => b.onclick = () => {
     const note = prompt("Reason for rejecting (shown to the agent):") || "";

@@ -59,11 +59,15 @@ func decide(run core.Run, steps []core.Step) action {
 		}
 	}
 
-	// 3. Look at the model's latest turn.
+	// 3. Look at the model's latest turn, and at the latest user message
+	//    (conversations). max_turns counts model calls per user message.
 	var last *core.Step
-	llmTurns := 0
+	llmTurns, lastUser := 0, 0
 	for i := range steps {
-		if steps[i].Kind == core.StepLLM && steps[i].Status == core.StepCompleted {
+		switch {
+		case steps[i].Kind == core.StepUser:
+			lastUser, llmTurns = steps[i].Seq, 0
+		case steps[i].Kind == core.StepLLM && steps[i].Status == core.StepCompleted:
 			last = &steps[i]
 			llmTurns++
 		}
@@ -77,8 +81,8 @@ func decide(run core.Run, steps []core.Step) action {
 		}
 		return action{kind: actCallLLM, seq: next}
 	}
-	if last == nil || last.LLM == nil {
-		return callLLM()
+	if last == nil || last.LLM == nil || lastUser > last.Seq {
+		return callLLM() // nothing answered yet, or a new user message to answer
 	}
 	if len(last.LLM.ToolCalls) == 0 {
 		return action{kind: actComplete, output: last.LLM.Content}
@@ -125,6 +129,8 @@ func conversation(run core.Run, steps []core.Step) []provider.Message {
 			}
 		case core.StepTool:
 			msgs = append(msgs, provider.Message{Role: "tool", ToolCallID: s.ToolCallID, Content: s.Result, IsError: s.IsError})
+		case core.StepUser:
+			msgs = append(msgs, provider.Message{Role: "user", Content: s.Result})
 		}
 	}
 	return msgs

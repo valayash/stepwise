@@ -100,6 +100,7 @@ Details and trade-offs: [docs/DESIGN.md](docs/DESIGN.md).
 | **Crash-safe execution** | Steps persisted before the next starts; replay on resume; leases + fencing tokens against zombie workers |
 | **Exactly-once side effects** | Stable idempotency key per tool call (`Idempotency-Key` header for HTTP tools, `_meta` for MCP) |
 | **Tools** | HTTP tools, any **MCP** server (Streamable HTTP; tools discovered with `tools/list`), and sub-agents; per-tool `headers` with `${STEPWISE_SECRET_*}` references for auth |
+| **Conversations** | `POST /v1/runs/{id}/messages` continues a completed run: one run = one conversation, one audit trail, one budget; `max_turns` applies per message |
 | **Human-in-the-loop** | `require_approval` per tool; approve or reject via API or UI; rejections are shown to the model so it can adapt; `approval_timeout` (e.g. `"24h"`) rejects calls nobody answered |
 | **Sub-agents** | A tool can be another agent; children run in parallel as durable runs; tokens roll up to the parent's budget |
 | **Self-healing triage** | When a run fails, a triage agent reads it, records a diagnosis, and asks (with approval) to retry transient failures |
@@ -164,6 +165,7 @@ go run ./cmd/stepwise worker           # in another terminal: more workers, same
 | `GET` | `/v1/runs/{id}/events` | Live updates (server-sent events) until the run ends |
 | `POST` | `/v1/runs/{id}/steps/{step}/approve` · `/reject` | Decide a pending tool call (`note`, `decided_by`) |
 | `POST` | `/v1/runs/{id}/cancel` · `/retry` | Cancel (cascades to sub-agents) · retry a failed run |
+| `POST` | `/v1/runs/{id}/messages` | Continue a completed run as a conversation (`content`); the next reply arrives like any run's output |
 | `GET` | `/v1/approvals` | Inbox of every tool call waiting for a human |
 | `GET` | `/v1/usage` | This month's runs and tokens, and the monthly limit |
 | `GET` | `/v1/runs/{id}/deliveries` | Webhook delivery log |

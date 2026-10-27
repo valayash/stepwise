@@ -55,6 +55,7 @@ type StepKind string
 const (
 	StepLLM  StepKind = "llm"
 	StepTool StepKind = "tool"
+	StepUser StepKind = "user" // a follow-up message in a conversation; the text is in Result
 )
 
 // StepStatus is where a step is.

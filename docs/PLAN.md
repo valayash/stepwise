@@ -141,7 +141,7 @@ From the agent catalog ([docs/research/agent-catalog.md](research/agent-catalog.
 types people deploy, mapped to the capabilities each needs. Ordered by how many agents each
 unlocks and by dependency.
 
-- [ ] **Conversations (multi-turn runs).** `POST /v1/runs/{id}/messages` adds a user message as
+- [x] **Conversations (multi-turn runs).** `POST /v1/runs/{id}/messages` adds a user message as
       a step and reopens the run (the way Retry does); the engine replays it into the model's
       history. One run = one conversation and one audit trail. Unlocks support, IT and HR bots.
 - [ ] **Documents and images as input.** Runs accept PDFs and images (URL or base64) and pass

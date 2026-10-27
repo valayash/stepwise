@@ -39,6 +39,10 @@ Open http://localhost:8080 → **New run** → pick an **Example** → **Start**
 | Tool on a blocked host | Refused **before** the run starts: "tool url … is not in the allowed tool hosts". |
 | Token budget too small | **Failed** with "token budget used up", plus a **Triage diagnosis: budget**. |
 
+**Conversations:** open any completed run (e.g. start one with `{"agent":{"model":"mock"},"input":"Hello"}`),
+type in **Continue the conversation** and **Send**. The run goes back to queued, the timeline adds a
+**Message** step and a new **Model** reply, and Output shows the latest answer.
+
 The header shows this month's tokens against the limit and how many approvals are waiting. To
 see the spend limit refuse runs, restart with `STEPWISE_MONTHLY_TOKEN_LIMIT=1000` and start a
 few runs: new ones fail with HTTP 429 "monthly token limit … reached".

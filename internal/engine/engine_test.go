@@ -218,6 +218,28 @@ func TestRetentionDeletesFinishedRuns(t *testing.T) {
 	t.Error("finished run was not deleted")
 }
 
+func TestConversationContinuesARun(t *testing.T) {
+	h := newHarness(t)
+	h.start()
+	run := h.create(core.AgentSpec{Model: "mock", MaxTurns: 1}, "hi", 0) // max_turns counts per message
+	if out := h.waitStatus(run.ID, core.RunCompleted).Output; out != "mock: hi" {
+		t.Fatalf("first reply = %q", out)
+	}
+	if _, err := h.store.AddMessage(context.Background(), run.ID, "and the second thing?"); err != nil {
+		t.Fatal(err)
+	}
+	if out := h.waitStatus(run.ID, core.RunCompleted).Output; out != "mock: and the second thing?" {
+		t.Errorf("second reply = %q", out)
+	}
+	var kinds []string
+	for _, s := range h.steps(run.ID) {
+		kinds = append(kinds, string(s.Kind))
+	}
+	if strings.Join(kinds, ",") != "llm,user,llm" {
+		t.Errorf("steps = %v", kinds)
+	}
+}
+
 func TestCrashAfterSideEffectIsExactlyOnce(t *testing.T) {
 	h := newHarness(t)
 	spec, _ := h.runner.Prepare(context.Background(), core.AgentSpec{Model: "mock", Tools: []core.ToolSpec{{Type: core.ToolMCP, URL: h.shopMC, Include: []string{"issue_refund"}}}})

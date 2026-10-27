@@ -172,6 +172,27 @@ func TestMonthlyTokenLimit(t *testing.T) {
 	}
 }
 
+func TestConversationOverHTTP(t *testing.T) {
+	e := setup(t, "")
+	_, run := e.do("POST", "/v1/runs", `{"agent":{"model":"mock"},"input":"hi"}`)
+	id := run["id"].(string)
+	e.waitStatus(id, "completed")
+	if code, _ := e.do("POST", "/v1/runs/"+id+"/messages", `{"content":"  "}`); code != 400 {
+		t.Errorf("empty message = %d", code)
+	}
+	if code, out := e.do("POST", "/v1/runs/"+id+"/messages", `{"content":"more please"}`); code != 200 || out["status"] != "queued" {
+		t.Fatalf("message = %d %v", code, out)
+	}
+	if done := e.waitStatus(id, "completed"); done["output"] != "mock: more please" {
+		t.Errorf("reply = %v", done["output"])
+	}
+	_, waiting := e.do("POST", "/v1/runs", refundBody(e.shop))
+	e.waitStatus(waiting["id"].(string), "waiting")
+	if code, _ := e.do("POST", "/v1/runs/"+waiting["id"].(string)+"/messages", `{"content":"hello?"}`); code != 409 {
+		t.Errorf("message to a waiting run = %d, want 409", code)
+	}
+}
+
 func TestIdempotencyKeyHeader(t *testing.T) {
 	e := setup(t, "")
 	body := `{"agent":{"model":"mock"},"input":"hi"}`

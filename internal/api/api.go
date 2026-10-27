@@ -75,6 +75,7 @@ func (s *Server) Handler() http.Handler {
 	v1.HandleFunc("GET /v1/runs/{id}/deliveries", s.serveJSON(s.deliveries))
 	v1.HandleFunc("POST /v1/runs/{id}/cancel", s.serveJSON(s.mutate(s.Store.Cancel)))
 	v1.HandleFunc("POST /v1/runs/{id}/retry", s.serveJSON(s.mutate(s.Store.Retry)))
+	v1.HandleFunc("POST /v1/runs/{id}/messages", s.serveJSON(s.addMessage))
 	v1.HandleFunc("POST /v1/runs/{id}/steps/{step}/approve", s.serveJSON(s.decide(true)))
 	v1.HandleFunc("POST /v1/runs/{id}/steps/{step}/reject", s.serveJSON(s.decide(false)))
 	v1.HandleFunc("GET /v1/approvals", s.serveJSON(s.approvals))
@@ -359,6 +360,27 @@ func (s *Server) decide(approve bool) handlerFunc {
 		}
 		return s.view(r.Context(), id)
 	}
+}
+
+// addMessage continues a completed run as a conversation.
+func (s *Server) addMessage(w http.ResponseWriter, r *http.Request) (any, error) {
+	var body struct {
+		Content string `json:"content"`
+	}
+	if !s.decode(w, r, &body) {
+		return nil, errWritten
+	}
+	if strings.TrimSpace(body.Content) == "" {
+		return nil, fmt.Errorf("%w: content is required", core.ErrInvalid)
+	}
+	if err := s.checkSpend(r.Context()); err != nil {
+		return nil, err
+	}
+	id := r.PathValue("id")
+	if _, err := s.Store.AddMessage(r.Context(), id, body.Content); err != nil {
+		return nil, err
+	}
+	return s.view(r.Context(), id)
 }
 
 type pendingApproval struct {
