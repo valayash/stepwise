@@ -35,6 +35,8 @@ func Run(t *testing.T, newStore Factory) {
 		"CancelCascadesAndFences":       testCancel,
 		"RetryFailedRun":                testRetry,
 		"MessageContinuesRun":           testConversation,
+		"CancelledRunHasNoApprovals":    testCancelledApprovals,
+		"CountActiveByMetadata":         testCountActive,
 		"WebhookOutbox":                 testOutbox,
 		"ConcurrentClaimsNeverOverlap":  testConcurrentClaims,
 		"ListRunsFilters":               testListRuns,
@@ -258,6 +260,7 @@ func testApprovalFlow(t *testing.T, s store.Store) {
 	if p, _ := s.PendingApprovals(ctx); len(p) != 0 {
 		t.Errorf("decided call still pending: %+v", p)
 	}
+
 	if err := s.DecideApproval(ctx, r.ID, st.ID, core.Approval{Approved: true}); !errors.Is(err, core.ErrNotRunnable) {
 		t.Errorf("double decision: %v", err)
 	}
@@ -539,5 +542,24 @@ func testConversation(t *testing.T, s store.Store) {
 	}
 	if _, err := s.AddMessage(ctx, "nope", "x"); !errors.Is(err, core.ErrNotFound) {
 		t.Errorf("message to a missing run: %v", err)
+	}
+}
+
+func testCountActive(t *testing.T, s store.Store) {
+	mustCreate(t, s, core.NewRun{Input: "a", Metadata: json.RawMessage(`{"triage_of":"x"}`)})
+	mustCreate(t, s, core.NewRun{Input: "b", Metadata: json.RawMessage(`{"ticket":"y"}`)})
+	mustCreate(t, s, core.NewRun{Input: "c"})
+	if n, err := s.CountActive(ctx, "triage_of"); err != nil || n != 1 {
+		t.Errorf("CountActive = %d, %v; want 1", n, err)
+	}
+}
+
+func testCancelledApprovals(t *testing.T, s store.Store) {
+	r, _ := pendingApproval(t, s)
+	if err := s.Cancel(ctx, r.ID); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := s.PendingApprovals(ctx); len(p) != 0 {
+		t.Errorf("a cancelled run's approval is still pending: %+v", p)
 	}
 }

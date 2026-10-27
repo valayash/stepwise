@@ -192,6 +192,9 @@ func run(ctx context.Context, log *slog.Logger, cfg config.Config, r roles) erro
 	if r.worker {
 		start("engine", func() { eng.Run(ctx) })
 	}
+	if r.api && !r.dispatcher {
+		log.Warn("this process does not deliver webhooks; run `stepwise webhooks` alongside it")
+	}
 	if r.dispatcher {
 		d := &webhook.Dispatcher{Store: st, Secret: []byte(cfg.WebhookSecret), Log: log}
 		d.RegisterMetrics(reg)

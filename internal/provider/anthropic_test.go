@@ -40,6 +40,7 @@ func TestAnthropicComplete(t *testing.T) {
 			{Role: "user", Content: "hi"},
 		},
 		ResponseSchema: json.RawMessage(`{"type":"object"}`),
+		Cache:          true,
 	})
 	if err != nil {
 		t.Fatalf("Complete: %v", err)
@@ -128,6 +129,9 @@ func TestAnthropicStream(t *testing.T) {
 	srv := sseServer(t, anthropicSSE, func(got anthropicRequest) {
 		if !got.Stream {
 			t.Error("request did not set stream=true")
+		}
+		if got.CacheControl != nil {
+			t.Error("a request without Cache (e.g. the gateway) must not pay the cache-write premium")
 		}
 	})
 	defer srv.Close()

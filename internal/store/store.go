@@ -27,8 +27,11 @@ type Store interface {
 	GetRun(ctx context.Context, id string) (core.Run, error)
 	ListRuns(ctx context.Context, f ListFilter) ([]core.Run, error)
 	ListSteps(ctx context.Context, runID string) ([]core.Step, error)
-	// Usage totals top-level runs created since a time (sub-agent tokens
-	// already roll up into their parents).
+	// CountActive counts unfinished runs whose metadata has the given key.
+	CountActive(ctx context.Context, metadataKey string) (int, error)
+	// Usage counts top-level runs created since a time, and tokens of model
+	// calls completed since then (sub-agents and later turns of older
+	// conversations included).
 	Usage(ctx context.Context, since time.Time) (Usage, error)
 
 	// ---- workers ----
@@ -58,7 +61,8 @@ type Store interface {
 	// ---- humans ----
 
 	DecideApproval(ctx context.Context, runID string, stepID int64, a core.Approval) error
-	// PendingApprovals lists every tool call waiting for a human, oldest first.
+	// PendingApprovals lists every tool call waiting for a human on a run that
+	// isn't finished (a cancelled run's pending calls are moot), oldest first.
 	PendingApprovals(ctx context.Context) ([]core.Step, error)
 	// DeleteFinished deletes up to limit finished top-level runs that completed
 	// before a time, with their sub-agents, steps and deliveries. It returns

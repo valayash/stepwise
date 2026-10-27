@@ -64,7 +64,7 @@ func (e *Engine) maybeTriage(ctx context.Context, failed core.Run, o store.Outco
 		e.diagnoseByRules(ctx, failed, cat, "Provider or network failure: "+oneLine(o.Error)+". Retry once it recovers.")
 		return
 	}
-	if n := e.activeTriageRuns(ctx); n >= e.cfg.Triage.MaxActive {
+	if n, _ := e.store.CountActive(ctx, "triage_of"); n >= e.cfg.Triage.MaxActive {
 		e.diagnoseByRules(ctx, failed, cat, fmt.Sprintf("%s (rule-based: %d triage runs already active)", oneLine(o.Error), n))
 		return
 	}
@@ -115,20 +115,6 @@ func (e *Engine) diagnoseByRules(ctx context.Context, failed core.Run, category,
 	if category == "transient" && e.cfg.Triage.AutoRetry && failed.Triage == nil {
 		_ = e.store.Retry(ctx, failed.ID)
 	}
-}
-
-// activeTriageRuns counts unfinished triage runs among the newest runs.
-func (e *Engine) activeTriageRuns(ctx context.Context) int {
-	n := 0
-	for _, st := range []core.RunStatus{core.RunQueued, core.RunRunning, core.RunWaiting} {
-		runs, _ := e.store.ListRuns(ctx, store.ListFilter{Status: st, Limit: 1000})
-		for _, r := range runs {
-			if triageOf(r) != "" {
-				n++
-			}
-		}
-	}
-	return n
 }
 
 // classify is a rule-based first guess the triage agent can confirm or override.

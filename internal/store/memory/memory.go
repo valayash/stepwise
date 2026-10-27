@@ -112,6 +112,20 @@ func (m *Store) GetRun(_ context.Context, id string) (core.Run, error) {
 	return clone(r), nil
 }
 
+// CountActive implements store.Store.
+func (m *Store) CountActive(_ context.Context, metadataKey string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, r := range m.runs {
+		var meta map[string]json.RawMessage
+		if !r.Status.Terminal() && json.Unmarshal(r.Metadata, &meta) == nil && meta[metadataKey] != nil {
+			n++
+		}
+	}
+	return n, nil
+}
+
 // Usage implements store.Store.
 func (m *Store) Usage(_ context.Context, since time.Time) (store.Usage, error) {
 	m.mu.Lock()
@@ -120,7 +134,13 @@ func (m *Store) Usage(_ context.Context, since time.Time) (store.Usage, error) {
 	for _, r := range m.runs {
 		if r.ParentRunID == "" && !r.CreatedAt.Before(since) {
 			u.Runs++
-			u.Tokens += r.TokensUsed
+		}
+	}
+	for _, steps := range m.steps {
+		for _, s := range steps {
+			if s.Kind == core.StepLLM && s.CompletedAt != nil && !s.CompletedAt.Before(since) {
+				u.Tokens += s.Tokens()
+			}
 		}
 	}
 	return u, nil
@@ -287,9 +307,9 @@ func (m *Store) SaveStep(_ context.Context, f core.Fence, s core.Step) error {
 			return nil, core.ErrNotFound
 		}
 		wasCompleted := ex.Status == core.StepCompleted
-		attempts, created, id, seq := ex.Attempts, ex.CreatedAt, ex.ID, ex.Seq
+		attempts, created, completed, id, seq := ex.Attempts, ex.CreatedAt, ex.CompletedAt, ex.ID, ex.Seq
 		*ex = s
-		ex.ID, ex.Seq, ex.RunID, ex.Attempts, ex.CreatedAt = id, seq, f.RunID, attempts, created
+		ex.ID, ex.Seq, ex.RunID, ex.Attempts, ex.CreatedAt, ex.CompletedAt = id, seq, f.RunID, attempts, created, completed // stored fields, like Postgres
 		if ex.Status == core.StepCompleted && !wasCompleted {
 			ex.CompletedAt = &now
 			r.TokensUsed += ex.Tokens()
@@ -448,7 +468,10 @@ func (m *Store) PendingApprovals(_ context.Context) ([]core.Step, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var out []core.Step
-	for _, steps := range m.steps {
+	for runID, steps := range m.steps {
+		if m.runs[runID].Status.Terminal() {
+			continue
+		}
 		for _, s := range steps {
 			if s.Status == core.StepPendingApproval {
 				out = append(out, clone(s))

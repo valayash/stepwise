@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/valayash/stepwise/internal/core"
@@ -44,6 +45,14 @@ type Server struct {
 	// Kill, if set, simulates a crash of the worker executing a run (only possible
 	// when the API and workers share a process: dev and serve).
 	Kill func(runID string) bool
+
+	// UsageCacheTTL is how long usage is reused (default 10s): the spend check
+	// runs on every create, and the limit can be overshot by that window's spend.
+	UsageCacheTTL time.Duration
+
+	usageMu    sync.Mutex
+	usageCache usageView
+	usageAt    time.Time
 }
 
 // Info describes this deployment to clients and the UI.
@@ -194,12 +203,23 @@ type usageView struct {
 	Limit int       `json:"monthly_token_limit,omitempty"`
 }
 
-// monthUsage is this calendar month's spend (UTC).
+// monthUsage is this calendar month's spend (UTC), cached for UsageCacheTTL.
 func (s *Server) monthUsage(ctx context.Context) (usageView, error) {
 	now := time.Now().UTC()
 	v := usageView{Since: time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC), Limit: s.MonthlyTokenLimit}
+	s.usageMu.Lock()
+	defer s.usageMu.Unlock()
+	ttl := s.UsageCacheTTL
+	if ttl <= 0 {
+		ttl = 10 * time.Second
+	}
+	if now.Sub(s.usageAt) < ttl && s.usageCache.Since.Equal(v.Since) {
+		return s.usageCache, nil
+	}
 	var err error
-	v.Usage, err = s.Store.Usage(ctx, v.Since)
+	if v.Usage, err = s.Store.Usage(ctx, v.Since); err == nil {
+		s.usageCache, s.usageAt = v, now
+	}
 	return v, err
 }
 

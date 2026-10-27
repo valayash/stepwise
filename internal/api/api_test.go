@@ -159,7 +159,7 @@ func TestCreateValidation(t *testing.T) {
 }
 
 func TestMonthlyTokenLimit(t *testing.T) {
-	e := setup(t, "", func(s *Server) { s.MonthlyTokenLimit = 1 })
+	e := setup(t, "", func(s *Server) { s.MonthlyTokenLimit, s.UsageCacheTTL = 1, time.Nanosecond })
 	body := `{"agent":{"model":"mock"},"input":"hi"}`
 	_, run := e.do("POST", "/v1/runs", body)
 	e.waitStatus(run["id"].(string), "completed")

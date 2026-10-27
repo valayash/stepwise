@@ -47,6 +47,10 @@ type Request struct {
 	Temperature *float64
 	// ResponseSchema, if set, constrains the final answer to JSON matching it.
 	ResponseSchema json.RawMessage
+	// Cache asks the provider to cache the prompt prefix. Worth it when the same
+	// conversation comes back (agent turns); a one-off call would only pay the
+	// cache-write premium.
+	Cache bool
 }
 
 // Response is a provider-neutral completion result.

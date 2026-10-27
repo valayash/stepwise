@@ -105,7 +105,7 @@ Details and trade-offs: [docs/DESIGN.md](docs/DESIGN.md).
 | **Sub-agents** | A tool can be another agent; children run in parallel as durable runs; tokens roll up to the parent's budget |
 | **Self-healing triage** | When a run fails, a triage agent reads it, records a diagnosis, and asks (with approval) to retry. Provider outages are diagnosed by rules with no LLM call, and at most 10 triage runs are active at once, so a burst of failures can't start hundreds |
 | **Provider resilience** | Token-bucket rate limits (RPM + TPM) shared by every worker through Redis, circuit breaker per provider, retries with jittered exponential backoff, `Retry-After` support |
-| **Structured output** | `response_schema` (JSON Schema) on the agent: the final answer is JSON matching it, via the provider's native structured-output mode; anything else fails the run instead of returning bad JSON |
+| **Structured output** | `response_schema` (JSON Schema) on the agent: the final answer is JSON matching it, via the provider's native structured-output mode; anything else fails the run instead of returning bad JSON. Write strict schemas: `"additionalProperties": false` on every object and every property in `required` (both providers' strict modes need it) |
 | **Budgets and limits** | Per-run token budget and `max_turns`; per-tool call limits (`"limits": {"issue_refund": 1}`); monthly token limit |
 | **Webhooks** | Transactional outbox; HMAC-SHA256 signatures with timestamps; retries; dead-lettering |
 | **Observability** | OpenTelemetry traces (one trace per run: the trace ID *is* the run ID; `gen_ai.*` attributes; `traceparent` sent to tools); Prometheus metrics; JSON logs; live updates over SSE |

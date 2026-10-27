@@ -458,7 +458,7 @@ func (x *execution) callLLM(ctx context.Context, seq int) error {
 	start := x.e.now()
 	resp, err := p.Complete(callCtx, provider.Request{
 		Model: model, Messages: msgs, Tools: toolDefs, MaxTokens: maxTokens, Temperature: spec.Temperature,
-		ResponseSchema: spec.ResponseSchema,
+		ResponseSchema: spec.ResponseSchema, Cache: true,
 	})
 	cancel()
 	elapsed := x.e.now().Sub(start)

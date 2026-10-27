@@ -457,11 +457,21 @@ func (s *Store) ListRuns(ctx context.Context, f store.ListFilter) ([]core.Run, e
 	return scanAll(rows, err, scanRun)
 }
 
+// CountActive implements store.Store.
+func (s *Store) CountActive(ctx context.Context, metadataKey string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM runs
+		WHERE status IN ('queued', 'running', 'waiting') AND metadata->>$1 IS NOT NULL`, metadataKey).Scan(&n)
+	return n, err
+}
+
 // Usage implements store.Store.
 func (s *Store) Usage(ctx context.Context, since time.Time) (store.Usage, error) {
 	var u store.Usage
-	err := s.db.QueryRowContext(ctx, `SELECT count(*), COALESCE(sum(tokens_used), 0) FROM runs
-		WHERE parent_run_id IS NULL AND created_at >= $1`, since).Scan(&u.Runs, &u.Tokens)
+	err := s.db.QueryRowContext(ctx, `SELECT
+		(SELECT count(*) FROM runs WHERE parent_run_id IS NULL AND created_at >= $1),
+		(SELECT COALESCE(sum((llm->>'input_tokens')::bigint + (llm->>'output_tokens')::bigint), 0)
+		   FROM steps WHERE kind = 'llm' AND completed_at >= $1)`, since).Scan(&u.Runs, &u.Tokens)
 	return u, err
 }
 
@@ -774,7 +784,8 @@ func finishTx(ctx context.Context, tx *sql.Tx, r core.Run, o store.Outcome) erro
 
 // PendingApprovals implements store.Store.
 func (s *Store) PendingApprovals(ctx context.Context) ([]core.Step, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+stepCols+` FROM steps WHERE status = 'pending_approval' ORDER BY created_at`)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+prefixed(stepCols, "s")+` FROM steps s JOIN runs r ON r.id = s.run_id
+		WHERE s.status = 'pending_approval' AND r.status NOT IN ('completed', 'failed', 'cancelled') ORDER BY s.created_at`)
 	return scanAll(rows, err, scanStep)
 }
 

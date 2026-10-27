@@ -245,7 +245,8 @@ const refundAgent = extra => ({model: "mock", system: "You are a refund agent. L
 const presets = {
   "Refund with approval": () => ({agent: refundAgent(), input: refundInput, budget_tokens: 20000, metadata: {ticket: "SUP-4821"}}),
   "Approval expires after 20s": () => ({agent: refundAgent({approval_timeout: "20s"}), input: refundInput}),
-  "Structured JSON output": () => ({agent: {model: "mock", response_schema: {type: "object", properties: {order_id: {type: "string"}, amount: {type: "number"}, reason: {type: "string"}}}},
+  "Structured JSON output": () => ({agent: {model: "mock", response_schema: {type: "object", properties: {order_id: {type: "string"}, amount: {type: "number"}, reason: {type: "string"}},
+    required: ["order_id", "amount", "reason"], additionalProperties: false}},
     input: refundInput}),
   "Sub-agent (parallel research)": () => ({agent: {model: "mock", system: "Delegate order research to the researcher, then summarise.",
     tools: [{type: "agent", name: "researcher", description: "Researches one order.", agent: {model: "mock", tools: [{type: "mcp", url: shopURL, include: ["get_order", "check_refund_policy"]}]}}]},

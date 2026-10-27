@@ -271,11 +271,13 @@ func (a *Anthropic) Stream(ctx context.Context, req Request, onDelta DeltaFunc) 
 // On success the caller owns resp.Body.
 func (a *Anthropic) send(ctx context.Context, req Request, stream bool) (*http.Response, error) {
 	body := anthropicRequest{
-		Model:        req.Model,
-		MaxTokens:    req.MaxTokens,
-		Temperature:  req.Temperature,
-		Stream:       stream,
-		CacheControl: &anthropicCacheControl{Type: "ephemeral"},
+		Model:       req.Model,
+		MaxTokens:   req.MaxTokens,
+		Temperature: req.Temperature,
+		Stream:      stream,
+	}
+	if req.Cache {
+		body.CacheControl = &anthropicCacheControl{Type: "ephemeral"}
 	}
 	if len(req.ResponseSchema) > 0 {
 		body.OutputConfig = &anthropicOutputConfig{Format: jsonSchemaFormat{Type: "json_schema", Schema: req.ResponseSchema}}
