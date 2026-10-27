@@ -245,7 +245,6 @@ func (m *Store) BeginStep(_ context.Context, f core.Fence, s core.Step) (out cor
 		if err != nil {
 			return nil, err
 		}
-		r.UpdatedAt = now
 		for _, ex := range m.steps[f.RunID] {
 			if ex.Seq != s.Seq {
 				continue

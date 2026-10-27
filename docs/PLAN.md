@@ -127,9 +127,10 @@ measurements and should be re-checked when each item is built.
       Measured here: chaos on Postgres (1,000 runs, 8 workers) 442 → 626 steps/s (+42%).
 - [x] **Deferred yields.** Don't send `runs_ready` for runs requeued into the future.
 - [x] **Approvals inbox N+1.** Fixed with `PendingApprovals` (one query).
-- [ ] **Connection pool.** Idle connections = open connections.
-- [ ] **Fewer writes per step.** `fillfactor` on `runs`, drop the redundant `touch`, lighter
-      `lockFenced`.
+- [x] **Connection pool.** Idle connections = open connections.
+- [x] **Fewer writes per step.** Dropped the `touch` UPDATE in BeginStep (+5% steps/s with the pool
+      change). Not done, by measurement: `fillfactor` (updates are already 94–95% HOT; no tps
+      change) and a lighter `lockFenced` (low gain for a change to every write path).
 - [ ] **Triage storms.** Skip the LLM triage call when the rules already classify a failure as transient.
 
 ## Phase 3: Features the common agents need

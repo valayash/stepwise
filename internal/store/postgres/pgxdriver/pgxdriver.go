@@ -23,7 +23,7 @@ func Open(url string) (*sql.DB, postgres.Listener, error) {
 	}
 	db := stdlib.OpenDB(*cfg)
 	db.SetMaxOpenConns(32)
-	db.SetMaxIdleConns(8)
+	db.SetMaxIdleConns(32) // = open: closing idle connections under bursts costs a reconnect and pgx's prepared statements
 	db.SetConnMaxIdleTime(5 * time.Minute)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

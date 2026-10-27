@@ -565,7 +565,7 @@ func (s *Store) BeginStep(ctx context.Context, f core.Fence, st core.Step) (core
 		default:
 			return err
 		}
-		return touch(ctx, tx, f.RunID) // no notification per step: live views poll
+		return nil // no run update or notification per step: one fewer write on runs, and live views poll
 	})
 	return out, err
 }
