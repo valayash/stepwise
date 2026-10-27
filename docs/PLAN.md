@@ -131,7 +131,9 @@ measurements and should be re-checked when each item is built.
 - [x] **Fewer writes per step.** Dropped the `touch` UPDATE in BeginStep (+5% steps/s with the pool
       change). Not done, by measurement: `fillfactor` (updates are already 94–95% HOT; no tps
       change) and a lighter `lockFenced` (low gain for a change to every write path).
-- [ ] **Triage storms.** Skip the LLM triage call when the rules already classify a failure as transient.
+- [ ] **Triage storms.** Skip the LLM triage call when the rules already classify a failure as
+      transient. **Needs a decision:** it removes the "approve a retry" step for outage failures
+      (the README's self-healing triage). Alternative: cap concurrent triage runs instead.
 
 ## Phase 3: Features the common agents need
 
