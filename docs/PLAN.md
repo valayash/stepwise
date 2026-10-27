@@ -134,6 +134,22 @@ measurements and should be re-checked when each item is built.
 - [x] **Triage storms.** Outages are diagnosed by rules with no LLM call; other failures are
       capped at 10 active triage runs, past which they get a rule-based diagnosis too.
 
+## Phase 2c: Runtime research (pending a decision)
+
+From [docs/research/runtime-optimizations.md](research/runtime-optimizations.md): the binding
+limit is provider quota and price, not workers or Postgres.
+
+- [ ] **429 as fleet backpressure:** pause the model's limiter bucket until `retry-after`; don't
+      trip the circuit breaker or use up the run's attempts
+- [ ] **Count tokens like the provider does:** uncached input + cache writes + actual output, so
+      cache hits don't throttle us
+- [ ] **Tool-result masking** (replaces the planned "shrink old tool results"): placeholders for
+      old results, cut-off moved in chunks so the prompt cache rarely breaks
+- [ ] **Least-progress-first requeue with jitter** under rate limiting
+- [ ] **Cheaper tier for non-urgent runs** (OpenAI flex, later Anthropic batches)
+- [ ] Smaller: OpenAI `prompt_cache_key` = run ID; 1-hour cache for agents with sub-agents;
+      fail a run that repeats the same tool call with the same result 3 times
+
 ## Phase 3: Features the common agents need
 
 From the agent catalog ([docs/research/agent-catalog.md](research/agent-catalog.md)): 15 agent
