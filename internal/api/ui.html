@@ -78,6 +78,7 @@ a { color: var(--accent); }
 <header>
   <h1>Stepwise <span>durable agent runtime</span></h1>
   <div class="spacer"></div>
+  <span id="usage" class="meta"></span>
   <span id="inbox" class="meta"></span>
   <input id="token" type="password" placeholder="API token (if set)" size="16">
   <button class="primary" id="new">New run</button>
@@ -92,7 +93,8 @@ a { color: var(--accent); }
 
 <dialog id="dlg">
   <h3 style="margin-top:0">Start a run</h3>
-  <p class="meta">POSTs this body to <code>/v1/runs</code>. The example uses the built-in demo shop (an MCP server) and needs approval before refunding.</p>
+  <p class="meta">POSTs this body to <code>/v1/runs</code>. Examples use the built-in demo shop (an MCP server) and the free <code>mock</code> model.
+    Example: <select id="preset"></select></p>
   <textarea id="body"></textarea>
   <div class="notice" id="dlgErr"></div>
   <div class="actions"><button class="primary" id="go">Start</button><button id="close">Close</button></div>
@@ -143,6 +145,8 @@ async function refresh() {
     $("#runs").querySelectorAll(".run").forEach(el => el.onclick = () => select(el.dataset.id));
     const {approvals} = await api("/v1/approvals");
     $("#inbox").textContent = approvals.length ? `${approvals.length} awaiting approval` : "";
+    const u = await api("/v1/usage");
+    $("#usage").textContent = `${u.tokens} tokens this month` + (u.monthly_token_limit ? ` of ${u.monthly_token_limit}` : "");
   } catch (e) { $("#runs").innerHTML = `<div class="empty" style="margin-top:20px">${esc(e.message)}</div>`; }
 }
 
@@ -228,19 +232,26 @@ function select(id) {
 let shopURL = location.origin + "/demo/mcp";
 api("/v1/info").then(i => { if (i.demo_shop_url) shopURL = i.demo_shop_url; }).catch(() => {});
 
-const example = () => JSON.stringify({
-  agent: {
-    model: "mock",
-    system: "You are a refund agent. Look up the order, check the refund policy, then refund if eligible.",
-    tools: [{type: "mcp", url: shopURL}],
-    require_approval: ["issue_refund"]
-  },
-  input: "Customer Asha says her earbuds arrived broken. order_id: ORD-1001, amount: 49.99, reason: damaged",
-  budget_tokens: 20000,
-  metadata: {ticket: "SUP-4821"}
-}, null, 2);
+// One example per feature; each is a refund agent on the demo shop with one thing changed.
+const refundInput = "Customer Asha says her earbuds arrived broken. order_id: ORD-1001, amount: 49.99, reason: damaged";
+const refundAgent = extra => ({model: "mock", system: "You are a refund agent. Look up the order, check the refund policy, then refund if eligible.",
+  tools: [{type: "mcp", url: shopURL}], require_approval: ["issue_refund"], ...extra});
+const presets = {
+  "Refund with approval": () => ({agent: refundAgent(), input: refundInput, budget_tokens: 20000, metadata: {ticket: "SUP-4821"}}),
+  "Approval expires after 20s": () => ({agent: refundAgent({approval_timeout: "20s"}), input: refundInput}),
+  "Structured JSON output": () => ({agent: {model: "mock", response_schema: {type: "object", properties: {order_id: {type: "string"}, amount: {type: "number"}, reason: {type: "string"}}}},
+    input: refundInput}),
+  "Sub-agent (parallel research)": () => ({agent: {model: "mock", system: "Delegate order research to the researcher, then summarise.",
+    tools: [{type: "agent", name: "researcher", description: "Researches one order.", agent: {model: "mock", tools: [{type: "mcp", url: shopURL, include: ["get_order", "check_refund_policy"]}]}}]},
+    input: "Is order ORD-1003 refundable?\ntask: Research order_id: ORD-1003"}),
+  "Tool on a blocked host (needs STEPWISE_ALLOWED_TOOL_HOSTS)": () => ({agent: {model: "mock",
+    tools: [{type: "http", name: "metadata", url: "http://169.254.169.254/latest", input_schema: {type: "object"}}]}, input: "x"}),
+  "Token budget too small (fails)": () => ({agent: refundAgent(), input: refundInput, budget_tokens: 60}),
+};
+$("#preset").innerHTML = Object.keys(presets).map(k => `<option>${esc(k)}</option>`).join("");
+$("#preset").onchange = () => { $("#body").value = JSON.stringify(presets[$("#preset").value](), null, 2); };
 
-$("#new").onclick = () => { if (!$("#body").value) $("#body").value = example(); $("#dlgErr").textContent = ""; $("#dlg").showModal(); };
+$("#new").onclick = () => { if (!$("#body").value) $("#preset").onchange(); $("#dlgErr").textContent = ""; $("#dlg").showModal(); };
 $("#close").onclick = () => $("#dlg").close();
 $("#go").onclick = async () => {
   try {

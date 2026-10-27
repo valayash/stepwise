@@ -207,6 +207,8 @@ Stepwise is a focused, self-hosted engine for one job — running tool-using age
 
 ## Testing
 
+Step-by-step checks for every feature, from no setup to production-like: [docs/TESTING.md](docs/TESTING.md).
+
 ```bash
 make test                                   # unit + integration tests, race detector on
 STEPWISE_TEST_DATABASE_URL=... make test    # also runs the Postgres store tests
