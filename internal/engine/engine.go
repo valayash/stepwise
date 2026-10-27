@@ -431,7 +431,7 @@ func (x *execution) callLLM(ctx context.Context, seq int) error {
 	toolDefs := spec.ToolDefs()
 
 	br := x.e.breakers.Get(p.Name())
-	estimate, err := x.admit(ctx, br, p.Name(), model, ratelimit.EstimateTokens(promptChars(msgs, toolDefs), maxTokens))
+	estimate, err := x.admit(ctx, br, p.Name(), model, x.estimate(msgs, toolDefs, maxTokens))
 	if err != nil {
 		return err
 	}
@@ -478,6 +478,16 @@ func (x *execution) callLLM(ctx context.Context, seq int) error {
 			br.Abort()
 			return ctx.Err() // lease lost or shutting down: someone else will redo this step
 		}
+		if provider.RateLimited(err) {
+			// Quota, not an outage: no breaker failure and no attempt used.
+			// Pausing the limiter makes every worker wait, not just this run.
+			br.Abort()
+			wait := max(retryAfter(err), breaker.Backoff(step.Attempts, x.e.cfg.BackoffBase, x.e.cfg.BackoffMax))
+			_ = x.e.limiter.Pause(context.WithoutCancel(ctx), model, wait)
+			x.e.m.rateLimited.Inc(model)
+			x.e.m.llmCalls.Inc(p.Name(), "rate_limited")
+			return x.yield(ctx, store.Yield{Status: core.RunQueued, AvailableAt: x.e.now().Add(wait), Attempts: x.run.Attempts, Error: err.Error()})
+		}
 		if !provider.Retryable(err) {
 			br.Success() // the provider answered; it is up
 			x.e.m.llmCalls.Inc(p.Name(), "error")
@@ -490,7 +500,9 @@ func (x *execution) callLLM(ctx context.Context, seq int) error {
 
 	br.Success()
 	used := resp.InputTokens + resp.OutputTokens
-	_ = x.e.limiter.Settle(context.WithoutCancel(ctx), model, used-estimate)
+	// Anthropic (the only provider that reports CachedTokens) does not count
+	// cache reads toward rate limits; budgets still count them.
+	_ = x.e.limiter.Settle(context.WithoutCancel(ctx), model, used-resp.CachedTokens-estimate)
 	x.e.m.llmCalls.Inc(p.Name(), "ok")
 	x.e.m.tokens.Add(float64(resp.InputTokens), model, "input")
 	x.e.m.tokens.Add(float64(resp.OutputTokens), model, "output")
@@ -506,6 +518,23 @@ func (x *execution) callLLM(ctx context.Context, seq int) error {
 	x.run.Attempts = 0
 	x.e.m.steps.Inc(string(core.StepLLM))
 	return nil
+}
+
+// estimate guesses the tokens a call counts toward the rate limit. When the
+// last model call read from the prompt cache within its 5-minute lifetime,
+// this call's prompt starts with that call's, so most of it is a cache read.
+func (x *execution) estimate(msgs []provider.Message, defs []provider.ToolDef, maxTokens int) int {
+	n := ratelimit.EstimateTokens(promptChars(msgs, defs), maxTokens)
+	var last *core.Step
+	for i := range x.steps {
+		if s := &x.steps[i]; s.Kind == core.StepLLM && s.LLM != nil && (last == nil || s.Seq > last.Seq) {
+			last = s
+		}
+	}
+	if last != nil && last.LLM.CachedTokens > 0 && last.CompletedAt != nil && x.e.now().Sub(*last.CompletedAt) < 5*time.Minute {
+		n = max(n-last.LLM.InputTokens, maxTokens+1)
+	}
+	return n
 }
 
 // admit asks the circuit breaker (cheap, local), then the shared rate

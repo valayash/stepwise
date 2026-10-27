@@ -244,6 +244,8 @@ const refundAgent = extra => ({model: "mock", system: "You are a refund agent. L
   tools: [{type: "mcp", url: shopURL}], require_approval: ["issue_refund"], ...extra});
 const presets = {
   "Refund with approval": () => ({agent: refundAgent(), input: refundInput, budget_tokens: 20000, metadata: {ticket: "SUP-4821"}}),
+  "Support chat (reply with Continue the conversation)": () => ({agent: {model: "mock", system: "You are a friendly support agent for an online shop. Answer questions and look up orders.",
+    tools: [{type: "mcp", url: shopURL, include: ["get_order"]}]}, input: "Hi, where is my order? order_id: ORD-1002"}),
   "Approval expires after 20s": () => ({agent: refundAgent({approval_timeout: "20s"}), input: refundInput}),
   "Structured JSON output": () => ({agent: {model: "mock", response_schema: {type: "object", properties: {order_id: {type: "string"}, amount: {type: "number"}, reason: {type: "string"}},
     required: ["order_id", "amount", "reason"], additionalProperties: false}},

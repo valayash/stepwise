@@ -24,9 +24,10 @@ type Redis struct {
 // script refills and adjusts the request bucket (KEYS[1]) and the token
 // bucket (KEYS[2]).
 //
-//	ARGV[1] op: "reserve" or "settle"
+//	ARGV[1] op: "reserve", "settle" or "pause"
 //	ARGV[2] rpm, ARGV[3] tpm (0 = unlimited)
-//	ARGV[4] tokens to reserve, or the settle delta (> 0 takes, < 0 refunds)
+//	ARGV[4] tokens to reserve, the settle delta (> 0 takes, < 0 refunds),
+//	        or the pause in seconds
 //
 // reserve returns 0 when granted, else milliseconds to wait (nothing taken).
 var script = redis.NewScript(`
@@ -41,15 +42,20 @@ local function load(key, cap)
   if level == nil then return cap end
   return math.min(cap, level + (now - ts) * cap / 60)
 end
-local function save(key, level)
+local function save(key, level, cap)
   redis.call('HSET', key, 'level', level, 'ts', now)
-  redis.call('EXPIRE', key, 180)
+  redis.call('EXPIRE', key, 180 + math.ceil(math.max(0, -level) * 60 / cap))
 end
 
 if op == 'settle' then
   if tpm > 0 and n ~= 0 then
-    save(KEYS[2], math.min(tpm, load(KEYS[2], tpm) - n))
+    save(KEYS[2], math.min(tpm, load(KEYS[2], tpm) - n), tpm)
   end
+  return 0
+end
+if op == 'pause' then
+  if rpm > 0 then save(KEYS[1], math.min(load(KEYS[1], rpm), -n * rpm / 60), rpm) end
+  if tpm > 0 then save(KEYS[2], math.min(load(KEYS[2], tpm), -n * tpm / 60), tpm) end
   return 0
 end
 
@@ -66,8 +72,8 @@ end
 if wait > 0 then
   return math.ceil(wait * 1000)
 end
-if req then save(KEYS[1], req - 1) end
-if tok then save(KEYS[2], tok - need) end
+if req then save(KEYS[1], req - 1, rpm) end
+if tok then save(KEYS[2], tok - need, tpm) end
 return 0
 `)
 
@@ -119,6 +125,18 @@ func (l *Redis) Settle(ctx context.Context, model string, delta int) error {
 		return nil
 	}
 	if err := script.Run(ctx, l.client, l.keys(r), "settle", r.RPM, r.TPM, delta).Err(); err != nil {
+		return fmt.Errorf("redis rate limiter: %w", err)
+	}
+	return nil
+}
+
+// Pause implements Limiter.
+func (l *Redis) Pause(ctx context.Context, model string, d time.Duration) error {
+	r, ok := l.rules.Lookup(model)
+	if !ok || d <= 0 {
+		return nil
+	}
+	if err := script.Run(ctx, l.client, l.keys(r), "pause", r.RPM, r.TPM, d.Seconds()).Err(); err != nil {
 		return fmt.Errorf("redis rate limiter: %w", err)
 	}
 	return nil

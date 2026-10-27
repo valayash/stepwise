@@ -139,9 +139,9 @@ measurements and should be re-checked when each item is built.
 From [docs/research/runtime-optimizations.md](research/runtime-optimizations.md): the binding
 limit is provider quota and price, not workers or Postgres.
 
-- [ ] **429 as fleet backpressure:** pause the model's limiter bucket until `retry-after`; don't
+- [x] **429 as fleet backpressure:** pause the model's limiter bucket until `retry-after`; don't
       trip the circuit breaker or use up the run's attempts
-- [ ] **Count tokens like the provider does:** uncached input + cache writes + actual output, so
+- [x] **Count tokens like the provider does:** uncached input + cache writes + actual output, so
       cache hits don't throttle us
 - [ ] **Tool-result masking** (replaces the planned "shrink old tool results"): placeholders for
       old results, cut-off moved in chunks so the prompt cache rarely breaks

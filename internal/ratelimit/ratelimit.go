@@ -34,6 +34,9 @@ type Limiter interface {
 	// Settle corrects the token count once real usage is known: delta > 0
 	// takes more, delta < 0 gives tokens back.
 	Settle(ctx context.Context, model string, delta int) error
+	// Pause empties model's buckets for d, e.g. after the provider answered
+	// 429: every worker's Reserve then waits about d instead of calling it.
+	Pause(ctx context.Context, model string, d time.Duration) error
 }
 
 // Rules maps models to rules by longest matching prefix.
@@ -196,6 +199,23 @@ func (l *Local) Settle(_ context.Context, model string, delta int) error {
 	return nil
 }
 
+// Pause implements Limiter. It reuses the debt Settle allows: refill
+// brings the level back to zero after d.
+func (l *Local) Pause(_ context.Context, model string, d time.Duration) error {
+	r, ok := l.rules.Lookup(model)
+	if !ok {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, b := range l.get(r, l.now()) {
+		if b != nil {
+			b.level = math.Min(b.level, -d.Seconds()*b.perSec)
+		}
+	}
+	return nil
+}
+
 // Unlimited never limits. Useful in tests.
 type Unlimited struct{}
 
@@ -204,6 +224,9 @@ func (Unlimited) Reserve(context.Context, string, int) (time.Duration, error) { 
 
 // Settle implements Limiter.
 func (Unlimited) Settle(context.Context, string, int) error { return nil }
+
+// Pause implements Limiter.
+func (Unlimited) Pause(context.Context, string, time.Duration) error { return nil }
 
 // EstimateTokens guesses a request's cost before sending it: about four
 // characters per token for the prompt, plus the full output allowance.

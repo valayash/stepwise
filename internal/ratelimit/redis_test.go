@@ -63,6 +63,17 @@ func TestRedisReserveAndSettleTokens(t *testing.T) {
 	}
 }
 
+func TestRedisPauseIsSharedAcrossProcesses(t *testing.T) {
+	a, b := redisPair(t, Rules{{Prefix: "m", RPM: 60, TPM: 6000}})
+	ctx := context.Background()
+	if err := a.Pause(ctx, "m", 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if w, _ := b.Reserve(ctx, "m", 0); w < 4*time.Second || w > 7*time.Second {
+		t.Fatalf("other process's wait after a 5s pause = %v", w)
+	}
+}
+
 func TestRedisConcurrentReservationsNeverOverspend(t *testing.T) {
 	a, b := redisPair(t, Rules{{Prefix: "m", TPM: 1000}})
 	ctx := context.Background()

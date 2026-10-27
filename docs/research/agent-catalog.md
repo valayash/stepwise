@@ -52,7 +52,7 @@ converses with it; **Event** = another system's webhook; **Schedule** = runs on 
 | JSON results (`response_schema`) | 2, 5–9, 11, 15 | ✅ |
 | Sub-agents in parallel | 15, 13 | ✅ |
 | Webhooks out, audit trail, retention | All | ✅ |
-| **Conversations (multi-turn)** | 1, 3, 4 | ❌ planned |
+| **Conversations (multi-turn)** | 1, 3, 4 | ✅ done (`POST /v1/runs/{id}/messages`) |
 | **Hand over to a human** (and back) | 1, 3, 4 | ❌ needs conversations |
 | **Documents and images as input** | 5–9 | ❌ input is text only |
 | **Schedules** (cron) | 6, 10, 11, 12, 14 | ❌ |

@@ -70,6 +70,19 @@ func TestSettleRefundsAndCharges(t *testing.T) {
 	}
 }
 
+func TestPauseMakesEveryoneWait(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	l := NewLocal(Rules{{Prefix: "m", RPM: 60, TPM: 600}}, c.now)
+	_ = l.Pause(ctx, "m", 5*time.Second)
+	if w, _ := l.Reserve(ctx, "m", 0); w < 5*time.Second || w > 6*time.Second {
+		t.Fatalf("wait after a 5s pause = %v", w)
+	}
+	c.add(6 * time.Second)
+	if w, _ := l.Reserve(ctx, "m", 10); w != 0 {
+		t.Fatalf("still paused after 6s: wait=%v", w)
+	}
+}
+
 func TestRequestsPerMinute(t *testing.T) {
 	c := &clock{t: time.Unix(0, 0)}
 	l := NewLocal(Rules{{Prefix: "m", RPM: 2}}, c.now)

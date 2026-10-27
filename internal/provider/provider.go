@@ -131,6 +131,14 @@ func Retryable(err error) bool {
 	return true
 }
 
+// RateLimited reports whether the provider refused the call for quota (429):
+// the provider is up, we are just going too fast.
+func RateLimited(err error) bool {
+	var ue *UpstreamError
+	var se *StreamError
+	return errors.As(err, &ue) && ue.Status == 429 || errors.As(err, &se) && se.Type == "rate_limit_error"
+}
+
 // Route maps a model-name prefix to a provider.
 type Route struct {
 	Prefix   string

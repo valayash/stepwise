@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/valayash/stepwise/internal/breaker"
 	"github.com/valayash/stepwise/internal/core"
 	"github.com/valayash/stepwise/internal/demo"
 	"github.com/valayash/stepwise/internal/mcp"
@@ -320,15 +322,19 @@ func TestCrashAfterSideEffectIsExactlyOnce(t *testing.T) {
 type flaky struct {
 	*provider.Mock
 	failFirst int32
+	status    int // default 503
+	cached    int // CachedTokens reported on success
 	calls     atomic.Int32
 }
 
 func (f *flaky) Name() string { return "flaky" }
 func (f *flaky) Complete(ctx context.Context, r provider.Request) (provider.Response, error) {
 	if f.calls.Add(1) <= f.failFirst {
-		return provider.Response{}, &provider.UpstreamError{Provider: "flaky", Status: 503, Body: "overloaded"}
+		return provider.Response{}, &provider.UpstreamError{Provider: "flaky", Status: cmp.Or(f.status, 503), Body: "overloaded"}
 	}
-	return f.Mock.Complete(ctx, r)
+	resp, err := f.Mock.Complete(ctx, r)
+	resp.CachedTokens = f.cached
+	return resp, err
 }
 
 func TestTransientFailuresAreRetried(t *testing.T) {
@@ -471,25 +477,33 @@ func TestCancelStopsTheWorker(t *testing.T) {
 	}
 }
 
-// stubLimiter defers the first reservation.
+// stubLimiter defers the first reservation and records what it was told.
 type stubLimiter struct {
-	mu       sync.Mutex
-	deferred bool
-	settled  int
+	mu                sync.Mutex
+	deferred          bool
+	reserved, settled int
+	pauses            int
 }
 
-func (s *stubLimiter) Reserve(context.Context, string, int) (time.Duration, error) {
+func (s *stubLimiter) Reserve(_ context.Context, _ string, n int) (time.Duration, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.deferred {
 		s.deferred = true
 		return 50 * time.Millisecond, nil
 	}
+	s.reserved += n
 	return 0, nil
 }
 func (s *stubLimiter) Settle(_ context.Context, _ string, d int) error {
 	s.mu.Lock()
 	s.settled += d
+	s.mu.Unlock()
+	return nil
+}
+func (s *stubLimiter) Pause(context.Context, string, time.Duration) error {
+	s.mu.Lock()
+	s.pauses++
 	s.mu.Unlock()
 	return nil
 }
@@ -509,6 +523,26 @@ func TestRateLimiterDefersWithoutBlockingWorkers(t *testing.T) {
 	}
 	if steps := h.steps(run.ID); steps[0].Attempts != 1 {
 		t.Errorf("a deferred call must not count as an attempt: %d", steps[0].Attempts)
+	}
+}
+
+func TestRateLimitErrorsPauseWithoutUsingAttempts(t *testing.T) {
+	fl := &flaky{Mock: provider.NewMock(), failFirst: 6, status: 429, cached: 3} // more 429s than MaxAttempts or the breaker allow
+	h := newHarness(t, provider.Route{Prefix: "flaky", Provider: fl})
+	lim := &stubLimiter{deferred: true}
+	h.deps.Limiter = lim
+	h.start()
+	run := h.create(core.AgentSpec{Model: "flaky"}, "hello", 0)
+	done := h.waitStatus(run.ID, core.RunCompleted)
+	if done.Attempts != 0 || lim.pauses != 6 {
+		t.Errorf("attempts = %d, pauses = %d; want 0 and 6", done.Attempts, lim.pauses)
+	}
+	if st := h.engine.breakers.Get("flaky").State(); st != breaker.Closed {
+		t.Errorf("breaker = %v; quota is not an outage", st)
+	}
+	llm := h.steps(run.ID)[0].LLM
+	if got, want := lim.reserved+lim.settled, llm.InputTokens+llm.OutputTokens-3; got != want {
+		t.Errorf("limiter charged %d tokens, want %d (cache reads don't count)", got, want)
 	}
 }
 
@@ -611,4 +645,26 @@ func TestTriageToolsOnlyTouchTheirOwnRun(t *testing.T) {
 		t.Errorf("a triage run acted on an unrelated run: %+v %v", res, err)
 	}
 	_ = mcp.ProtocolVersion
+}
+
+func TestEstimateSkipsARecentlyCachedPrefix(t *testing.T) {
+	now := time.Now()
+	recent, old := now.Add(-time.Minute), now.Add(-10*time.Minute)
+	msgs := []provider.Message{{Role: "user", Content: strings.Repeat("x", 40000)}} // ~10k tokens
+	x := &execution{e: &Engine{now: func() time.Time { return now }}}
+	full := x.estimate(msgs, nil, 100)
+	for _, c := range []struct {
+		name   string
+		step   core.Step
+		cached bool
+	}{
+		{"cache read a minute ago", core.Step{Kind: core.StepLLM, CompletedAt: &recent, LLM: &provider.Response{InputTokens: 9000, CachedTokens: 8000}}, true},
+		{"cache expired", core.Step{Kind: core.StepLLM, CompletedAt: &old, LLM: &provider.Response{InputTokens: 9000, CachedTokens: 8000}}, false},
+		{"provider doesn't cache", core.Step{Kind: core.StepLLM, CompletedAt: &recent, LLM: &provider.Response{InputTokens: 9000}}, false},
+	} {
+		x.steps = []core.Step{c.step}
+		if got := x.estimate(msgs, nil, 100); (got == full-9000) != c.cached {
+			t.Errorf("%s: estimate %d, full %d", c.name, got, full)
+		}
+	}
 }
